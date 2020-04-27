@@ -1,0 +1,14 @@
+#mybatis开启驼峰
+mybatis:
+  configuration:
+    map-underscore-to-camel-case: true
+#日志配置文件地址
+logging:
+  config: classpath:log4j2.xml
+
+#指定生效的配置文件
+spring:
+  application:
+    name: synStdCfgSvrImpl
+  profiles:
+    active: dev   #指定生效的配置文件 dev(application-dev.yml 开发环境), prod(application-prod.yml 线上环境), test(application-test.yml 测试环境)
