@@ -21,6 +21,7 @@ import java.util.Objects;
  */
 @Slf4j
 public class ProBufSchema implements KafkaDeserializationSchema<ConsumerRecord<String, Message>> {
+    private static volatile boolean isFirst = true;
     @Override
     public boolean isEndOfStream(ConsumerRecord<String, Message> stringMessageConsumerRecord) {
         return false;
@@ -31,6 +32,10 @@ public class ProBufSchema implements KafkaDeserializationSchema<ConsumerRecord<S
     @Override
     public ConsumerRecord<String, Message> deserialize(ConsumerRecord<byte[], byte[]> consumerRecord) {
         try {
+            if(isFirst){
+                Thread.sleep(30000);
+                isFirst = false;
+            }
             //key
             String key = simpleStringSchema.deserialize(consumerRecord.key());
             //value

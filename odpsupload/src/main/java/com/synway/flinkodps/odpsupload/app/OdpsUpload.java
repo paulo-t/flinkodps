@@ -13,14 +13,17 @@ import com.synway.flinkodps.odpsupload.kafka.Message;
 import com.synway.flinkodps.odpsupload.kafka.ProBufSchema;
 import com.synway.flinkodps.odpsupload.kafka.RedoSchema;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.flink.api.common.functions.FilterFunction;
+import org.apache.flink.api.common.functions  .FilterFunction;
 import org.apache.flink.api.common.state.MapStateDescriptor;
 import org.apache.flink.api.common.typeinfo.TypeHint;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.api.java.functions.KeySelector;
 import org.apache.flink.core.fs.FileSystem;
+import org.apache.flink.runtime.state.StateBackend;
+import org.apache.flink.runtime.state.filesystem.FsStateBackend;
 import org.apache.flink.streaming.api.CheckpointingMode;
+import org.apache.flink.streaming.api.TimeCharacteristic;
 import org.apache.flink.streaming.api.datastream.*;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.ProcessFunction;
@@ -43,12 +46,17 @@ import java.util.Properties;
 public class OdpsUpload {
     public static void main(String[] args) throws Exception {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        //checkpoint间隔15分钟
         String checkPointIntervalStr = ConfigUtils.get("check-point-interval", "900000");
         env.enableCheckpointing(ParseUtil.parseLong(checkPointIntervalStr,900000));
         //checkpoint模式
         env.getCheckpointConfig().setCheckpointingMode(CheckpointingMode.EXACTLY_ONCE);
         //两个checkpoint之间最小间隔500ms
         env.getCheckpointConfig().setMinPauseBetweenCheckpoints(500);
+        env.setStreamTimeCharacteristic(TimeCharacteristic.ProcessingTime);
+
+        StateBackend stateBackend = new FsStateBackend("file:///data/flink/checkpoints",true);
+        env.setStateBackend(stateBackend);
 
         //kafka消费者配置
         Properties consumerConfig = new Properties();
@@ -80,10 +88,45 @@ public class OdpsUpload {
 
         //获取odps库中表的信息和数据
         SingleOutputStreamOperator<OdpsInfo> dataWithDbInfoStream = messageKeyedStream.connect(broadcastConfig).process(new CreateOdpsInfo(configStateDescriptor, mappingStateDescriptor, noTableOutputTag));
-        //TODO 没有查询到表信息的数据
+
+        //没有查询到表信息的数据输出到文件
         DataStream<ConsumerRecord<String, Message>> noTableData = dataWithDbInfoStream.getSideOutput(noTableOutputTag);
         noTableData.writeAsText("/data1/odpsupload/noTableData", FileSystem.WriteMode.NO_OVERWRITE);
-        //入odps
+
+        //重试kafka消费者配置
+        Properties redoConfig = new Properties();
+        redoConfig.setProperty("bootstrap.servers", ConfigUtils.get("redo-broker-list","1.1.1.5:9092,1.1.1.10:9092"));
+        redoConfig.setProperty("group.id",ConfigUtils.get("odps-group-id","flink-odps"));
+        FlinkKafkaConsumer<OdpsInfo> redoConsumer = new FlinkKafkaConsumer<>(ConfigUtils.get("redo-topic", "odpsRedo"), new RedoSchema(), redoConfig);
+        DataStreamSource<OdpsInfo> initRedoStream = env.addSource(redoConsumer);
+        SingleOutputStreamOperator<OdpsInfo> filteredRedoStream = initRedoStream.filter((FilterFunction<OdpsInfo>) odpsInfo -> !Objects.isNull(odpsInfo));
+
+        //重试次数达到最大输出流tag
+        OutputTag<OdpsInfo> maxRedoTag = new OutputTag<OdpsInfo>("max-redo-side-output"){};
+        int maxRedoTime = ParseUtil.parseInt(ConfigUtils.get("max-redo-time","3"),3);
+
+        //过滤重试次数大于3的数据
+        SingleOutputStreamOperator<OdpsInfo> redoStream = filteredRedoStream.process(new ProcessFunction<OdpsInfo, OdpsInfo>() {
+            @Override
+            public void processElement(OdpsInfo odpsInfo, Context context, Collector<OdpsInfo> collector) throws Exception {
+                if (odpsInfo.getRedoTime() > maxRedoTime) {
+                    context.output(maxRedoTag, odpsInfo);
+                } else {
+                    collector.collect(odpsInfo);
+                }
+            }
+        });
+
+        //达到最大次数输出到文件不在重试
+        DataStream<OdpsInfo> maxRedoOutput = redoStream.getSideOutput(maxRedoTag);
+        maxRedoOutput.writeAsText("/data1/odpsupload/redoMax");
+
+        //重试流和正常流合并
+        DataStream<OdpsInfo> unionStream = dataWithDbInfoStream.union(dataWithDbInfoStream);
+        //union之后再做一次keyBy保证相同的表用同一个实例去处理
+        KeyedStream<OdpsInfo, String> odpsInfoStringKeyedStream = unionStream.keyBy((KeySelector<OdpsInfo, String>) odpsInfo -> odpsInfo.getProject() + "_" + odpsInfo.getTableName());
+
+        //odpsSink属性
         Properties props = new Properties();
         //每个数据块的数据数量
         props.setProperty("batch.size",ConfigUtils.get("batch-size","100000"));
@@ -105,39 +148,6 @@ public class OdpsUpload {
         props.setProperty("redo.broker.list",ConfigUtils.get("redo-broker-list","1.1.1.5:9092,1.1.1.10:9092"));
         //重试的topic
         props.setProperty("redo.topic",ConfigUtils.get("redo-topic","odpsRedo"));
-
-        //重试kafka消费者配置
-        Properties redoConfig = new Properties();
-        redoConfig.setProperty("bootstrap.servers", ConfigUtils.get("redo-broker-list","1.1.1.5:9092,1.1.1.10:9092"));
-        redoConfig.setProperty("group.id",ConfigUtils.get("odps-group-id","flink-odps"));
-        FlinkKafkaConsumer<OdpsInfo> redoConsumer = new FlinkKafkaConsumer<>(ConfigUtils.get("redo-topic", "odpsRedo"), new RedoSchema(), redoConfig);
-        DataStreamSource<OdpsInfo> initRedoStream = env.addSource(redoConsumer);
-        SingleOutputStreamOperator<OdpsInfo> filterRedoStream = initRedoStream.filter((FilterFunction<OdpsInfo>) odpsInfo -> !Objects.isNull(odpsInfo));
-
-        //找不到数据库表配置信息的数据输出流tag
-        OutputTag<OdpsInfo> maxRedoTag = new OutputTag<OdpsInfo>("max-redo-side-output"){};
-        int maxRedoTime = ParseUtil.parseInt(ConfigUtils.get("max-redo-time","3"),3);
-
-        SingleOutputStreamOperator<OdpsInfo> redoStream = filterRedoStream.process(new ProcessFunction<OdpsInfo, OdpsInfo>() {
-            @Override
-            public void processElement(OdpsInfo odpsInfo, Context context, Collector<OdpsInfo> collector) throws Exception {
-                if (odpsInfo.getRedoTime() > maxRedoTime) {
-                    context.output(maxRedoTag, odpsInfo);
-                } else {
-                    collector.collect(odpsInfo);
-                }
-            }
-        });
-
-        //达到最大次数不在重试
-        DataStream<OdpsInfo> maxRedoOutput = redoStream.getSideOutput(maxRedoTag);
-        maxRedoOutput.writeAsText("/data1/odpsupload/redoMax");
-
-        //重试流和正常流合并
-        DataStream<OdpsInfo> unionStream = dataWithDbInfoStream.union(dataWithDbInfoStream);
-        //union之后再做一次keyBy保证相同的表用同一个实例去处理
-        KeyedStream<OdpsInfo, String> odpsInfoStringKeyedStream = unionStream.keyBy((KeySelector<OdpsInfo, String>) odpsInfo -> odpsInfo.getProject() + "_" + odpsInfo.getTableName());
-
         //数据写入odps
         odpsInfoStringKeyedStream.addSink(new OdpsSink(props));
 

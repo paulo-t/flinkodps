@@ -27,9 +27,9 @@ public class TableConfig extends ConfigBase {
     protected List<FieldDO> getObjFields() {
         StringBuilder sqlSb = new StringBuilder();
         sqlSb.append("select ")
-                .append("tableid as table_id, tablename as table_name, tablename_b as table_name_b, objectname as object_name, objectmemo as object_memo, columnname as column_name, fieldtype as field_type, fieldchineename as field_chi_name, data_source ")
+                .append("tableid as table_id, tablename as table_name, tablename_b as table_name_b, objectname as object_name, objectmemo as object_memo, columnname as column_name, fieldtype as field_type, fieldchineename as field_chi_name, data_source, datatype as data_type ")
                 .append("from object o, objectfield oo ")
-                .append("where o.objectid = oo.objectid and (tablename like 'NB_TAB_%' or tablename_b like 'NB_TAB_%') ")
+                .append("where o.objectid = oo.objectid and datatype != 2 ")
                 .append("and objectstate in(0,1) and fieldid != 'SYN0104' ")
                 .append("order by o.objectid,recno");
 
@@ -69,18 +69,20 @@ public class TableConfig extends ConfigBase {
 
     @Override
     protected void addObject2Map(Map<String, OdpsTableConfig> map, String tableName, String tableId, OdpsTableConfig odpsTableConfig) {
-        map.put(tableName.length() >= 7 ? tableName.substring(7).toLowerCase() : tableName.toLowerCase(), odpsTableConfig);
+        if(!StringUtils.isEmpty(tableId)){
+            map.put(tableId.toLowerCase(), odpsTableConfig);
+        }
     }
 
     @Override
     protected void handleMemo(Map<String, OdpsTableConfig> map) {
         //mem单独处理
-        OdpsTableConfig memInfo = map.get("mem");
+        OdpsTableConfig memInfo = map.get("nb_tab_mem");
         if (!Objects.isNull(memInfo)) {
             OdpsTableConfig replace = new OdpsTableConfig();
             BeanUtils.copyProperties(memInfo, replace);
-            replace.setProject("synmem");
-            map.put("synmem", replace);
+            replace.setProject("nb_tab_synmem");
+            map.put("nb_tab_synmem", replace);
         }
     }
 }

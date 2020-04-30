@@ -46,25 +46,27 @@ public class CreateOdpsInfo extends KeyedBroadcastProcessFunction<String, Consum
 
     @Override
     public void processElement(ConsumerRecord<String, Message> record, ReadOnlyContext readOnlyContext, Collector<OdpsInfo> collector) throws Exception {
-        ReadOnlyBroadcastState<String, Map<String, OdpsTableConfig>> tableConfig = readOnlyContext.getBroadcastState(configStateDescriptor);
-        ReadOnlyBroadcastState<String, Map<String, String>> mappingConfig = readOnlyContext.getBroadcastState(mappingStateDescriptor);
+        ReadOnlyBroadcastState<String, Map<String, OdpsTableConfig>> tableConfigState = readOnlyContext.getBroadcastState(configStateDescriptor);
+        ReadOnlyBroadcastState<String, Map<String, String>> mappingConfigState = readOnlyContext.getBroadcastState(mappingStateDescriptor);
 
-        Map<String, OdpsTableConfig> tableDbConfig = tableConfig.get(TABLE_DATA_KEY);
-        Map<String, OdpsTableConfig> ctDbConfig = tableConfig.get(CT_DATA_KEY);
-        Map<String, String> mappingDbConfig = mappingConfig.get(MAPPING_DATA_KEY);
 
-        //没有数据库配置等待2s,只有刚启动第一次执行方法时可能没有
-        if(MapUtils.isNotEmpty(tableDbConfig) || MapUtils.isNotEmpty(ctDbConfig) || MapUtils.isNotEmpty(mappingDbConfig)){
-            Thread.sleep(2000);
+        Map<String, OdpsTableConfig> tableDbConfig = tableConfigState.get(TABLE_DATA_KEY);
+        Map<String, OdpsTableConfig> ctDbConfig = tableConfigState.get(CT_DATA_KEY);
+        Map<String, String> mappingDbConfig = mappingConfigState.get(MAPPING_DATA_KEY);
+        String judgeStr = "";
+        if(!StringUtils.isEmpty(record.value().getDataType())){
+            judgeStr = record.value().getDataType().toLowerCase();
+        }else if(!StringUtils.isEmpty(record.value().getDataTypeEx())){
+            judgeStr = record.value().getDataTypeEx().toLowerCase();
         }
 
-        String judgeStr = StringUtils.isEmpty(record.value().getDataTypeEx()) ? record.value().getDataTypeEx() : record.value().getDataType();
         OdpsTableConfig dbConfig = getJudgeMap(judgeStr, tableDbConfig, ctDbConfig, mappingDbConfig);
         if(Objects.isNull(dbConfig)){
             log.warn("table {} get judge failed.",judgeStr);
             readOnlyContext.output(noTableOutputTag,record);
             return;
         }
+
         //表信息和数据的组合
         OdpsInfo odpsInfo = new OdpsInfo();
         odpsInfo.setProject(dbConfig.getProject());

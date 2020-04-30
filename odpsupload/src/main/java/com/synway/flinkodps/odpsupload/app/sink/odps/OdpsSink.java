@@ -27,10 +27,7 @@ import org.apache.flink.streaming.api.functions.sink.RichSinkFunction;
 import java.io.IOException;
 import java.text.SimpleDateFormat;
 import java.util.*;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.stream.Collectors;
 
 /**
@@ -43,7 +40,9 @@ import java.util.stream.Collectors;
 public class OdpsSink extends RichSinkFunction<OdpsInfo> implements CheckpointedFunction {
     private static final SimpleDateFormat sdf = new SimpleDateFormat("yyyyMMdd");
     //线程池
-    private ExecutorService executorService;
+    private static volatile ExecutorService executorService;
+    //线程池锁
+    private static final String threadPoolLock = "ODPS:THREAD:LOCK";
     //数据库操作
     private OdpsDal dbBase;
     //配置属性
@@ -52,27 +51,33 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
     private transient ListState<RecordAccumulator> recordAccumulatorState;
     private ListStateDescriptor<RecordAccumulator> recordAccumulatorListStateDescriptor;
     //保存所有的数据累加器
-    private Map<String, RecordAccumulator> recordAccumulators;
+    private static Map<String, RecordAccumulator> recordAccumulators = Maps.newConcurrentMap();
     //session状态
     private transient ListState<SessionInfo> sessionState;
     private ListStateDescriptor<SessionInfo> sessionStateDiscriptor;
     //保存所有的uploadSession
-    private Map<String, SessionInfo> uploadSessions;
+    private static Map<String, SessionInfo> uploadSessions = Maps.newConcurrentMap();
 
 
     public OdpsSink(Properties prop) {
         this.prop = prop;
-        int poolSize = ParseUtil.parseInt(prop.get("pool.size"), 5);
         dbBase = OdpsDal.build();
-        executorService = new ThreadPoolExecutor(2, poolSize, 60L, TimeUnit.SECONDS, new ArrayBlockingQueue<>(20));
+
         recordAccumulatorListStateDescriptor = new ListStateDescriptor("accumulator-state", TypeInformation.of(new TypeHint<RecordAccumulator>() {
         }));
 
         sessionStateDiscriptor = new ListStateDescriptor("session-state", TypeInformation.of(new TypeHint<SessionInfo>() {
         }));
 
-        recordAccumulators = Maps.newLinkedHashMap();
-        uploadSessions = Maps.newLinkedHashMap();
+        //线程池初始化
+        int poolSize = ParseUtil.parseInt(prop.get("pool.size"), 5);
+        if (Objects.isNull(executorService)) {
+            synchronized (threadPoolLock) {
+                if (Objects.isNull(executorService)) {
+                    executorService = new ThreadPoolExecutor(2, poolSize, 60L, TimeUnit.SECONDS, new ArrayBlockingQueue<>(100));
+                }
+            }
+        }
     }
 
     @Override
@@ -142,35 +147,54 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
 
     private boolean send(RecordAccumulator accumulator) {
         boolean ret = true;
-        SessionInfo session = getSession(accumulator.getTableName(), accumulator.getProject());
-        if (Objects.isNull(session)) {
-            redo(accumulator);
-        }
-        //发送数据
-        session.getNewBlockId();
-
-        List<RecordAccumulator> recordAccumulators = splitAccumulator(accumulator);
-
-        for (RecordAccumulator recordAccumulator : recordAccumulators) {
-            executorService.execute(new UploadThread(session, recordAccumulator, ""));
-        }
+        SessionInfo session = null;
 
         try {
+            session = getSession(accumulator.getTableName(), accumulator.getProject());
+            if (Objects.isNull(session)) {
+                throw new TunnelException("session获取失败");
+            }
+
+            //发送数据
+            session.getNewBlockId();
+            //将数据拆分成多份发送
+            List<RecordAccumulator> recordAccumulators = splitAccumulator(accumulator);
+
+            List<Callable<Boolean>> threadList = Lists.newArrayList();
+
+            for (RecordAccumulator recordAccumulator : recordAccumulators) {
+                threadList.add(new UploadThread(session, recordAccumulator, prop.getProperty("split.str")));
+            }
+
+            List<Future<Boolean>> results = Lists.newArrayList();
+
+            for (Callable<Boolean> thread : threadList) {
+                results.add(executorService.submit(thread));
+            }
+
+            for (Future<Boolean> result : results) {
+                result.get();
+            }
+
             session.getUploadSession().commit();
-        } catch (TunnelException e) {
-            redo(accumulator);
+
+        } catch (InterruptedException | ExecutionException | TunnelException e) {
+            log.error("send data error:{}",e.getMessage());
             ret = false;
         } catch (IOException e) {
-            //io异常session废弃不再使用
+            log.error("send data io error:{}",e.getMessage());
+            //io错误上传的session不再使用
             session.abandon();
-            redo(accumulator);
             ret = false;
-        } finally {
+        }finally {
             //发送完成移除累加器数据
             recordAccumulators.remove(getSessionFlag(accumulator.getTableName(), accumulator.getProject()));
             return ret;
         }
     }
+
+    //统计方法
+
 
     /**
      * 重试
@@ -195,7 +219,7 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
             odpsInfo.setData(data.getData());
             odpsInfo.setRedoTime(data.getRedoTime() + 1);
             //发送到kafka
-            KafkaUtils.sendData(brokerList,accumulator.getTableName(),redoTopic, odpsInfo);
+            KafkaUtils.sendData(brokerList, accumulator.getTableName(), redoTopic, odpsInfo);
         }
     }
 
@@ -361,7 +385,8 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
         return String.format("%s='%s'", partitionFlag, sdf.format(new Date()));
     }
 
-    private final class UploadThread extends Thread {
+    private final class UploadThread implements Callable<Boolean> {
+
         private SessionInfo sessionInfo;
         private RecordAccumulator recordAccumulator;
         private final String splitStr;
@@ -372,8 +397,18 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
             this.splitStr = splitStr;
         }
 
+        /**
+         * 检查数据列数舒服正确
+         */
+        private boolean checkOdpsRecordData(String[] arrStr, TableSchema schema) {
+            int columnCount = schema.getColumns().size();
+            int arrCount = arrStr.length;
+
+            return columnCount == arrCount;
+        }
+
         @Override
-        public void run() {
+        public Boolean call() throws Exception {
             try {
                 TableTunnel.UploadSession uploadSession = sessionInfo.getUploadSession();
                 TableSchema schema = uploadSession.getSchema();
@@ -396,9 +431,9 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
 
                             Column column = schema.getColumn(j);
                             //2017-07-04 yzb增加 为了观察capture_time超长问题
-                            if(column.getName().toLowerCase().equals("capture_time")){
-                                if(strTemp.length() > 10){
-                                    log.error("capture_time超长.partition:{},offset:{}.{}",data.getPartition(),data.getOffset(),line);
+                            if (column.getName().toLowerCase().equals("capture_time")) {
+                                if (strTemp.length() > 10) {
+                                    log.error("capture_time超长.partition:{},offset:{}.{}", data.getPartition(), data.getOffset(), line);
                                     continue;
                                 }
                             }
@@ -425,27 +460,19 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
                         }
                     }
                 }
-
                 writer.close();
             } catch (TunnelException e) {
                 log.error("recordWriter write data tunnel failed.{}.partition:{},offset:{}", e.getErrorMsg(), recordAccumulator.getData().stream().map(r -> r.getPartition()).collect(Collectors.toList()), recordAccumulator.getData().stream().map(r -> r.getOffset()).collect(Collectors.toList()));
                 redo(recordAccumulator);
+                return false;
             } catch (IOException e) {
                 log.error("recordWriter write data io failed.{}.partition:{},offset:{}", e.getMessage(), recordAccumulator.getData().stream().map(r -> r.getPartition()).collect(Collectors.toList()), recordAccumulator.getData().stream().map(r -> r.getOffset()).collect(Collectors.toList()));
                 //io错误的话整个session会持续错误，直接停止不再处理
                 sessionInfo.abandon();
                 redo(recordAccumulator);
+                return false;
             }
-        }
-
-        /**
-         * 检查数据列数舒服正确
-         */
-        private boolean checkOdpsRecordData(String[] arrStr, TableSchema schema) {
-            int columnCount = schema.getColumns().size();
-            int arrCount = arrStr.length;
-
-            return columnCount == arrCount;
+            return true;
         }
     }
 }

@@ -129,8 +129,8 @@ public abstract class JdbcAbstractBase implements JdbcBase, Serializable {
             return null;
         }
 
-        PreparedStatement ps;
-        ResultSet rs;
+        PreparedStatement ps = null;
+        ResultSet rs = null;
 
         try {
             ps = con.prepareStatement(sql);
@@ -140,6 +140,16 @@ public abstract class JdbcAbstractBase implements JdbcBase, Serializable {
         } catch (SQLException e) {
             log.error("sql execute error, sql:{}.{}", sql, e.getMessage());
             return null;
+        } finally {
+            if (Objects.nonNull(rs)) {
+                close(rs);
+            }
+            if (Objects.nonNull(ps)) {
+                close(ps);
+            }
+            if (Objects.nonNull(con)) {
+                close(con);
+            }
         }
     }
 

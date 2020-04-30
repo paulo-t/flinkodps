@@ -37,7 +37,7 @@ public class FieldDO implements Serializable {
      */
     private String objectMemo;
     /**
-     *
+     *字段名
      */
     private String columnName;
     /**
@@ -52,4 +52,8 @@ public class FieldDO implements Serializable {
      * 系统 144
      */
     private int dataSource;
+    /**
+     *数据类型 2:知识库 其它资源库
+     */
+    private int dataType;
 }

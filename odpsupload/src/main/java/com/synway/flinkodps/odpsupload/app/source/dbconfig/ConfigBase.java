@@ -103,10 +103,12 @@ public abstract class ConfigBase {
             if (Objects.isNull(relation) || StringUtils.isEmpty(relation.getTableName()) || StringUtils.isEmpty(relation.getParentTableName())) {
                 continue;
             }
-            String subName = relation.getTableName().length() >= 7 ? relation.getTableName().substring(7).toLowerCase() : relation.getTableName().toLowerCase();
-            String psubName = relation.getParentTableName().length() >= 7 ? relation.getParentTableName().substring(7).toLowerCase() : relation.getParentTableName().toLowerCase();
+            String subName = relation.getTableName();
+            String psubName = relation.getParentTableName();
 
-            relationData.put(subName, psubName);
+            if(!StringUtils.isEmpty(subName) && !StringUtils.isEmpty(psubName)){
+                relationData.put(subName.toLowerCase(), psubName.toLowerCase());
+            }
         }
 
         return relationData;
@@ -142,7 +144,7 @@ public abstract class ConfigBase {
         for (FieldDO field : fields) {
             if (!StringUtils.isEmpty(field.getTableName())) {
                 //tableName不同并且字段的数量大于0说明是下一张表的字段
-                if (!field.getTableName().equalsIgnoreCase(tableName)) {
+                if (!field.getTableId().equalsIgnoreCase(tableId)) {
                     if (objFields.size() > 0) {
                         isNext = true;
                         OdpsTableConfig odpsTableConfig = createOdpsTableConfig(tableId, tableName, 0, 0, sys, objMemo, objName, objFields);

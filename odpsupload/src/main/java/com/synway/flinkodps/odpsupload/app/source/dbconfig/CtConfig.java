@@ -5,6 +5,7 @@ import com.synway.flinkodps.odpsupload.app.model.OdpsTableConfig;
 import com.synway.flinkodps.odpsupload.dal.model.FieldDO;
 import com.synway.flinkodps.odpsupload.enums.FieldType;
 import com.synway.flinkodps.odpsupload.enums.OdpsFieldType;
+import org.apache.commons.lang3.StringUtils;
 
 import java.util.List;
 import java.util.Map;
@@ -25,9 +26,9 @@ public class CtConfig extends ConfigBase {
 
         StringBuilder sqlSb = new StringBuilder();
         sqlSb.append("select ")
-                .append("tableid as table_id, tablename as table_name, objectname as object_name, objectmemo as object_memo, columnname as column_name, fieldtype as field_type, fieldchineename as field_chi_name, data_source ")
+                .append("tableid as table_id, tablename as table_name, objectname as object_name, objectmemo as object_memo, columnname as column_name, fieldtype as field_type, fieldchineename as field_chi_name, data_source, datatype as data_type ")
                 .append("from object o, objectfield oo ")
-                .append("where o.objectid = oo.objectid and tablename like 'NB_APP_%' ")
+                .append("where o.objectid = oo.objectid and datatype = 2 ")
                 .append("and objectstate in(0,1) and fieldid != 'SYN0104' ")
                 .append("order by o.objectid,recno");
 
@@ -60,7 +61,9 @@ public class CtConfig extends ConfigBase {
 
     @Override
     protected void addObject2Map(Map<String, OdpsTableConfig> map, String tableName, String tableId, OdpsTableConfig odpsTableConfig) {
-        map.put(tableId.toLowerCase(), odpsTableConfig);
+        if(!StringUtils.isEmpty(tableId)){
+            map.put(tableId.toLowerCase(), odpsTableConfig);
+        }
     }
 
     @Override
