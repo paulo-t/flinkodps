@@ -49,20 +49,25 @@ public class CreateOdpsInfo extends KeyedBroadcastProcessFunction<String, Consum
         ReadOnlyBroadcastState<String, Map<String, OdpsTableConfig>> tableConfigState = readOnlyContext.getBroadcastState(configStateDescriptor);
         ReadOnlyBroadcastState<String, Map<String, String>> mappingConfigState = readOnlyContext.getBroadcastState(mappingStateDescriptor);
 
-
         Map<String, OdpsTableConfig> tableDbConfig = tableConfigState.get(TABLE_DATA_KEY);
         Map<String, OdpsTableConfig> ctDbConfig = tableConfigState.get(CT_DATA_KEY);
         Map<String, String> mappingDbConfig = mappingConfigState.get(MAPPING_DATA_KEY);
         String judgeStr = "";
+
         if(!StringUtils.isEmpty(record.value().getDataType())){
-            judgeStr = record.value().getDataType().toLowerCase();
-        }else if(!StringUtils.isEmpty(record.value().getDataTypeEx())){
-            judgeStr = record.value().getDataTypeEx().toLowerCase();
+            String[] splits = record.value().getDataType().split("@");
+            judgeStr = splits[0];
+        }
+
+        //表名为空
+        if(StringUtils.isEmpty(judgeStr)){
+            log.error("data table name is null.partition:{},offset:{}",record.partition(),record.offset());
+            readOnlyContext.output(noTableOutputTag,record);
         }
 
         OdpsTableConfig dbConfig = getJudgeMap(judgeStr, tableDbConfig, ctDbConfig, mappingDbConfig);
         if(Objects.isNull(dbConfig)){
-            log.warn("table {} get judge failed.",judgeStr);
+            log.error("table {} get judge failed.",judgeStr);
             readOnlyContext.output(noTableOutputTag,record);
             return;
         }
@@ -70,7 +75,7 @@ public class CreateOdpsInfo extends KeyedBroadcastProcessFunction<String, Consum
         //表信息和数据的组合
         OdpsInfo odpsInfo = new OdpsInfo();
         odpsInfo.setProject(dbConfig.getProject());
-        odpsInfo.setTableId(dbConfig.getTableId());
+        odpsInfo.setTableId(readOnlyContext.getCurrentKey());
         odpsInfo.setTableName(dbConfig.getTableName());
         odpsInfo.setTableComment(dbConfig.getTableComment());
         odpsInfo.setColCount(dbConfig.getColCount());

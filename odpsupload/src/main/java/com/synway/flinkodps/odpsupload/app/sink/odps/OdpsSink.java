@@ -10,9 +10,12 @@ import com.google.common.collect.Maps;
 import com.synway.flinkodps.common.utils.ParseUtil;
 import com.synway.flinkodps.odpsupload.app.model.OdpsInfo;
 import com.synway.flinkodps.odpsupload.app.model.SessionInfo;
+import com.synway.flinkodps.odpsupload.dal.DbBase;
+import com.synway.flinkodps.odpsupload.dal.jdbc.druid.impl.OraStatDal;
 import com.synway.flinkodps.odpsupload.dal.odps.OdpsDal;
 import com.synway.flinkodps.odpsupload.utils.KafkaUtils;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.collections.CollectionUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.flink.api.common.state.ListState;
 import org.apache.flink.api.common.state.ListStateDescriptor;
@@ -25,6 +28,8 @@ import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
 import org.apache.flink.streaming.api.functions.sink.RichSinkFunction;
 
 import java.io.IOException;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.text.SimpleDateFormat;
 import java.util.*;
 import java.util.concurrent.*;
@@ -44,7 +49,9 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
     //线程池锁
     private static final String threadPoolLock = "ODPS:THREAD:LOCK";
     //数据库操作
-    private OdpsDal dbBase;
+    private OdpsDal odpsDal;
+    //统计数据
+    private DbBase oraStatDal;
     //配置属性
     private Properties prop;
     //数据状态
@@ -54,30 +61,27 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
     private static Map<String, RecordAccumulator> recordAccumulators = Maps.newConcurrentMap();
     //session状态
     private transient ListState<SessionInfo> sessionState;
-    private ListStateDescriptor<SessionInfo> sessionStateDiscriptor;
+    private ListStateDescriptor<SessionInfo> infoListStateDescriptor;
     //保存所有的uploadSession
     private static Map<String, SessionInfo> uploadSessions = Maps.newConcurrentMap();
 
+    /**
+     * 统计时使用的机器标识
+     */
+    private static String machineTag;
+
+    private static final String MACHINE_TAG_LOCK = "MACHILE_LOCK";
+    //异常系统表
+    private static final String STD_EXCEPTION_SYSINFO_TABLE = "EXCEPTIONDICTIONARY";
 
     public OdpsSink(Properties prop) {
         this.prop = prop;
-        dbBase = OdpsDal.build();
 
         recordAccumulatorListStateDescriptor = new ListStateDescriptor("accumulator-state", TypeInformation.of(new TypeHint<RecordAccumulator>() {
         }));
 
-        sessionStateDiscriptor = new ListStateDescriptor("session-state", TypeInformation.of(new TypeHint<SessionInfo>() {
+        infoListStateDescriptor = new ListStateDescriptor("session-state", TypeInformation.of(new TypeHint<SessionInfo>() {
         }));
-
-        //线程池初始化
-        int poolSize = ParseUtil.parseInt(prop.get("pool.size"), 5);
-        if (Objects.isNull(executorService)) {
-            synchronized (threadPoolLock) {
-                if (Objects.isNull(executorService)) {
-                    executorService = new ThreadPoolExecutor(2, poolSize, 60L, TimeUnit.SECONDS, new ArrayBlockingQueue<>(100));
-                }
-            }
-        }
     }
 
     @Override
@@ -119,7 +123,7 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
     public void initializeState(FunctionInitializationContext context) throws Exception {
         log.info("start initialize...");
         recordAccumulatorState = context.getOperatorStateStore().getListState(recordAccumulatorListStateDescriptor);
-        sessionState = context.getOperatorStateStore().getListState(sessionStateDiscriptor);
+        sessionState = context.getOperatorStateStore().getListState(infoListStateDescriptor);
         int accumulatorCounter = 0;
         int sessionCounter = 0;
         if (context.isRestored()) {
@@ -145,52 +149,75 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
         log.info("initialize end.accumulator:{},session:{}.", accumulatorCounter, sessionCounter);
     }
 
-    private boolean send(RecordAccumulator accumulator) {
-        boolean ret = true;
-        SessionInfo session = null;
+    private long send(RecordAccumulator accumulator) {
+        long writeCount = 0L;
 
-        try {
-            session = getSession(accumulator.getTableName(), accumulator.getProject());
-            if (Objects.isNull(session)) {
-                throw new TunnelException("session获取失败");
-            }
-
-            //发送数据
-            session.getNewBlockId();
-            //将数据拆分成多份发送
-            List<RecordAccumulator> recordAccumulators = splitAccumulator(accumulator);
-
-            List<Callable<Boolean>> threadList = Lists.newArrayList();
-
-            for (RecordAccumulator recordAccumulator : recordAccumulators) {
-                threadList.add(new UploadThread(session, recordAccumulator, prop.getProperty("split.str")));
-            }
-
-            List<Future<Boolean>> results = Lists.newArrayList();
-
-            for (Callable<Boolean> thread : threadList) {
-                results.add(executorService.submit(thread));
-            }
-
-            for (Future<Boolean> result : results) {
-                result.get();
-            }
-
-            session.getUploadSession().commit();
-
-        } catch (InterruptedException | ExecutionException | TunnelException e) {
-            log.error("send data error:{}",e.getMessage());
-            ret = false;
-        } catch (IOException e) {
-            log.error("send data io error:{}",e.getMessage());
-            //io错误上传的session不再使用
-            session.abandon();
-            ret = false;
-        }finally {
-            //发送完成移除累加器数据
-            recordAccumulators.remove(getSessionFlag(accumulator.getTableName(), accumulator.getProject()));
-            return ret;
+        SessionInfo session = getSession(accumulator.getTableName(), accumulator.getProject());
+        if (Objects.isNull(session)) {
+            log.error("project:{},table:{} failed get upload session.", accumulator.getProject(), accumulator.getTableName());
+            redo(accumulator);
         }
+
+        //发送数据
+        session.getNewBlockId();
+        //将数据拆分成多份发送
+        List<RecordAccumulator> recordAccumulators = splitAccumulator(accumulator);
+
+        List<UploadThread> threadList = Lists.newArrayList();
+
+        for (RecordAccumulator recordAccumulator : recordAccumulators) {
+            threadList.add(new UploadThread(session, recordAccumulator, prop.getProperty("split.str")));
+        }
+
+        List<Future<Long>> results = Lists.newArrayList();
+
+        for (UploadThread thread : threadList) {
+            results.add(executorService.submit(thread));
+        }
+
+        int i = 0;
+
+        for (Future<Long> result : results) {
+            UploadThread uploadThread = threadList.get(i);
+            try {
+                writeCount += result.get();
+            } catch (InterruptedException | ExecutionException e) {
+                //每一部分出错值单独重试
+                log.error("single data send error add to redo:{}", e.getMessage());
+                redo(uploadThread.getRecordAccumulator());
+            }
+            i++;
+        }
+
+        //发送完成移除累加器数据
+        recordAccumulators.remove(getSessionFlag(accumulator.getTableName(), accumulator.getProject()));
+
+        boolean commitRet = commit(session, accumulator,writeCount, 0L);
+
+        if(commitRet){
+            //统计成功数据
+        }else {
+            //统计失败数据
+
+        }
+
+        return commitRet ? writeCount : 0;
+    }
+
+    private boolean commit(SessionInfo session, RecordAccumulator accumulator,long writeCount, long time) {
+        try {
+            session.getUploadSession().commit();
+        } catch (TunnelException e) {
+            //网络异常阻塞重试
+            log.error("project:{}, table:{} session commit error, redo time {} :{}", accumulator.getProject(), accumulator.getTableName(), ++time, e.getMessage());
+            return commit(session, accumulator, writeCount,time);
+        } catch (IOException e) {
+            //io异常直接重试
+            redo(accumulator);
+            return false;
+        }
+        log.info("project:{}, table:{} commit success. count:{}",accumulator.getProject(),accumulator.getTableName(),writeCount);
+        return true;
     }
 
     //统计方法
@@ -252,12 +279,37 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
 
     @Override
     public void open(Configuration parameters) throws Exception {
-        super.open(parameters);
+        //线程池初始化
+        int poolSize = ParseUtil.parseInt(prop.get("pool.size"), 5);
+        if (Objects.isNull(executorService)) {
+            synchronized (threadPoolLock) {
+                if (Objects.isNull(executorService)) {
+                    executorService = new ThreadPoolExecutor(2, poolSize, 60L, TimeUnit.SECONDS, new ArrayBlockingQueue<>(100));
+                }
+            }
+        }
+
+        //数据访问层初始化
+        odpsDal = OdpsDal.build();
+        oraStatDal = OraStatDal.build();
+
+
+        //机器信息初始化
+        if(StringUtils.isEmpty(machineTag)){
+            synchronized (MACHINE_TAG_LOCK){
+                if(StringUtils.isEmpty(machineTag)){
+                    machineTag = getMachineTag();
+                }
+            }
+        }
+
     }
 
     @Override
     public void close() throws Exception {
-        super.close();
+        if(!executorService.isShutdown()){
+            executorService.shutdown();
+        }
     }
 
     /**
@@ -326,38 +378,44 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
     }
 
     /**
+     * 创建上传的session
+     */
+    private TableTunnel.UploadSession createUploadSession(TableTunnel tunnel, String project, String tableName, String partition, long retryTime) {
+        try {
+            if (partition.length() == 0) {
+                return tunnel.createUploadSession(project, tableName);
+            } else {
+                PartitionSpec partitionSpec = new PartitionSpec(partition);
+                return tunnel.createUploadSession(project, tableName, partitionSpec);
+            }
+        } catch (TunnelException e) {
+            //Tunnel异常递归重新获取
+            log.error("创建uploadSession失败，开始第{}次重试", ++retryTime);
+            return createUploadSession(tunnel, project, tableName, partition, retryTime);
+        }
+    }
+
+    /**
      * 创建session
      */
     private SessionInfo createSession(String tableName, String project) {
-        try {
-            SessionInfo sessionInfo = new SessionInfo();
 
-            Odps odps = dbBase.createOdps();
-            String partition = getPartition();
+        SessionInfo sessionInfo = new SessionInfo();
 
-            TableTunnel tunnel = new TableTunnel(odps);
-            tunnel.setEndpoint(prop.getProperty("tunnel.url"));
+        Odps odps = odpsDal.createOdps();
+        String partition = getPartition();
 
-            TableTunnel.UploadSession uploadSession;
-            if (partition.length() == 0) {
-                uploadSession = tunnel
-                        .createUploadSession(project, tableName);
-            } else {
-                PartitionSpec partitionSpec = new PartitionSpec(partition);
-                uploadSession = tunnel.createUploadSession(project,
-                        tableName, partitionSpec);
-            }
+        TableTunnel tunnel = new TableTunnel(odps);
+        tunnel.setEndpoint(prop.getProperty("tunnel.url"));
 
-            sessionInfo.setUploadSession(uploadSession);
-            sessionInfo.setCreateTime(System.currentTimeMillis());
-            sessionInfo.setProject(project);
-            sessionInfo.setTableName(tableName);
-            uploadSessions.put(getSessionFlag(tableName, project), sessionInfo);
-            return sessionInfo;
-        } catch (TunnelException e) {
-            log.error("create new upload session error:{}", e.getErrorMsg() + "." + e.getMessage());
-            return null;
-        }
+        TableTunnel.UploadSession uploadSession = createUploadSession(tunnel, project, tableName, partition, 0L);
+
+        sessionInfo.setUploadSession(uploadSession);
+        sessionInfo.setCreateTime(System.currentTimeMillis());
+        sessionInfo.setProject(project);
+        sessionInfo.setTableName(tableName);
+        uploadSessions.put(getSessionFlag(tableName, project), sessionInfo);
+        return sessionInfo;
     }
 
     /**
@@ -385,7 +443,7 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
         return String.format("%s='%s'", partitionFlag, sdf.format(new Date()));
     }
 
-    private final class UploadThread implements Callable<Boolean> {
+    private final class UploadThread implements Callable<Long> {
 
         private SessionInfo sessionInfo;
         private RecordAccumulator recordAccumulator;
@@ -395,6 +453,10 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
             this.sessionInfo = sessionInfo;
             this.recordAccumulator = recordAccumulator;
             this.splitStr = splitStr;
+        }
+
+        public RecordAccumulator getRecordAccumulator() {
+            return recordAccumulator;
         }
 
         /**
@@ -408,71 +470,185 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
         }
 
         @Override
-        public Boolean call() throws Exception {
+        public Long call() {
+            long writeCount = 0L;
             try {
                 TableTunnel.UploadSession uploadSession = sessionInfo.getUploadSession();
                 TableSchema schema = uploadSession.getSchema();
                 Record record = uploadSession.newRecord();
-                RecordWriter writer = uploadSession.openBufferedWriter();
+
+                long openBufferTime = 0L;
+                RecordWriter writer = openRecordWriter(uploadSession, openBufferTime);
+
                 for (AccumulatorData data : recordAccumulator.getData()) {
                     for (String line : data.getData()) {
-                        String[] arrStr = line.split(splitStr, -1);
-                        if (!checkOdpsRecordData(arrStr, schema)) {
-                            log.error("data check failed, schema:{}, arrStr:{}", schema.getColumns(), arrStr);
-                            continue;
-                        }
-                        int columnCount = schema.getColumns().size();
-                        for (int j = 0; j < columnCount; j++) {
-                            String strTemp = arrStr[j];
-
-                            if (StringUtils.isEmpty(strTemp)) {
-                                continue;
-                            }
-
-                            Column column = schema.getColumn(j);
-                            //2017-07-04 yzb增加 为了观察capture_time超长问题
-                            if (column.getName().toLowerCase().equals("capture_time")) {
-                                if (strTemp.length() > 10) {
-                                    log.error("capture_time超长.partition:{},offset:{}.{}", data.getPartition(), data.getOffset(), line);
-                                    continue;
-                                }
-                            }
-
-                            OdpsType odpsType = column.getTypeInfo().getOdpsType();
-
-                            switch (odpsType) {
-                                case BIGINT:
-                                    record.setBigint(j, ParseUtil.parseLong(strTemp, 0));
-                                    break;
-                                case BOOLEAN:
-                                    record.setBoolean(j, ParseUtil.parseBoolen(strTemp, false));
-                                    break;
-                                case DATETIME:
-                                    record.setDatetime(j, ParseUtil.parseDate(strTemp, null));
-                                case DOUBLE:
-                                    record.setDouble(j, ParseUtil.parseDouble(strTemp, 0));
-                                    break;
-                                default:
-                                    record.setString(j, strTemp);
-                                    break;
-                            }
-                            writer.write(record);
+                        boolean oneRet = writeOne(line, schema, writer, record, data.getPartition(), data.getOffset());
+                        if (oneRet) {
+                            writeCount++;
                         }
                     }
                 }
+
                 writer.close();
-            } catch (TunnelException e) {
-                log.error("recordWriter write data tunnel failed.{}.partition:{},offset:{}", e.getErrorMsg(), recordAccumulator.getData().stream().map(r -> r.getPartition()).collect(Collectors.toList()), recordAccumulator.getData().stream().map(r -> r.getOffset()).collect(Collectors.toList()));
-                redo(recordAccumulator);
-                return false;
             } catch (IOException e) {
                 log.error("recordWriter write data io failed.{}.partition:{},offset:{}", e.getMessage(), recordAccumulator.getData().stream().map(r -> r.getPartition()).collect(Collectors.toList()), recordAccumulator.getData().stream().map(r -> r.getOffset()).collect(Collectors.toList()));
                 //io错误的话整个session会持续错误，直接停止不再处理
                 sessionInfo.abandon();
                 redo(recordAccumulator);
+            }
+
+            return writeCount;
+        }
+
+
+        //打开recordWriter通道
+        private RecordWriter openRecordWriter(TableTunnel.UploadSession uploadSession, long retryTime) {
+            RecordWriter writer;
+            try {
+                writer = uploadSession.openBufferedWriter();
+            } catch (TunnelException e) {
+                //tunnel异常表示网络有问题别的表也不会正常打开通道这里做递归获取直至成功
+                log.error("open buffered writer error.start {} retry...", ++retryTime);
+                writer = openRecordWriter(uploadSession, retryTime);
+            }
+            return writer;
+        }
+
+        /**
+         * 写入一行数据
+         */
+        private boolean writeOne(String line, TableSchema schema, RecordWriter writer, Record record, int partition, long offset) throws IOException {
+            String[] arrStr = line.split(splitStr, -1);
+
+            if (!checkOdpsRecordData(arrStr, schema)) {
+                log.error("data check failed, schema:{}, arrStr:{}", schema.getColumns(), arrStr);
                 return false;
             }
+
+            int columnCount = schema.getColumns().size();
+
+            for (int j = 0; j < columnCount; j++) {
+                String strTemp = arrStr[j];
+
+                if (StringUtils.isEmpty(strTemp)) {
+                    continue;
+                }
+
+                Column column = schema.getColumn(j);
+                //2017-07-04 yzb增加 为了观察capture_time超长问题
+                if (column.getName().toLowerCase().equals("capture_time")) {
+                    if (strTemp.length() > 10) {
+                        log.error("capture_time超长.partition:{},offset:{}.{}", partition, offset, line);
+                        return false;
+                    }
+                }
+
+                OdpsType odpsType = column.getTypeInfo().getOdpsType();
+
+                switch (odpsType) {
+                    case BIGINT:
+                        record.setBigint(j, ParseUtil.parseLong(strTemp, 0));
+                        break;
+                    case BOOLEAN:
+                        record.setBoolean(j, ParseUtil.parseBoolen(strTemp, false));
+                        break;
+                    case DATETIME:
+                        record.setDatetime(j, ParseUtil.parseDate(strTemp, null));
+                    case DOUBLE:
+                        record.setDouble(j, ParseUtil.parseDouble(strTemp, 0));
+                        break;
+                    default:
+                        record.setString(j, strTemp);
+                        break;
+                }
+                writer.write(record);
+            }
+
             return true;
+        }
+    }
+
+    /**
+     * 统计相关代码
+     */
+    private String getMachineTag(){
+        String localIp = getIp();
+        String programTag = prop.getProperty("program.tag");
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("select ESI_GUID from ")
+                .append(STD_EXCEPTION_SYSINFO_TABLE)
+                .append(" where ESI_IP = '")
+                .append(localIp)
+                .append("' and ESI_PROTAG = '")
+                .append(programTag)
+                .append("'");
+
+        String sqlStr = sb.toString();
+
+        List<Object[]> objects = oraStatDal.execBySql(sqlStr);
+
+        if(!CollectionUtils.isEmpty(objects)){
+            for (Object[] object : objects) {
+                if(!Objects.isNull(object) && object.length > 0)
+                return object[0].toString();
+            }
+        }
+
+        return createNewMachineTag();
+    }
+
+    private String createNewMachineTag(){
+        String newGuid = UUID.randomUUID().toString().replace("-", "");
+        String programTag = prop.getProperty("progam.tag");
+        String localIp = getIp();
+        String hostName = getHost();
+
+        StringBuilder sql = new StringBuilder();
+        sql.append("insert into ")
+                .append(STD_EXCEPTION_SYSINFO_TABLE)
+                .append("(ESI_GUID,ESI_PROTAG,ESI_IP,ESI_COMPUTERNAME,ESI_FREQUENCY,ESI_STATUS)")
+                .append(" values(")
+                .append("'").append(newGuid).append("'").append(",")
+                .append("'" + programTag + "'").append(",")
+                .append("'" + localIp + "'").append(",")
+                .append("'" + hostName + "'").append(",")
+                .append(300).append(",")
+                .append(1)
+                .append(")");
+
+        if (oraStatDal.execSql(sql.toString())) {
+            log.info("machine tag create success.ip:{},host:{},program:{},guid:{}",localIp,hostName,programTag,newGuid);
+            return newGuid;
+        }else {
+            log.info("machine tag create failed.ip:{},host:{},program:{},guid:{}",localIp,hostName,programTag,newGuid);
+            return "";
+        }
+    }
+
+    /**
+     * 获取本机ip
+     */
+    private static String getIp() {
+        try {
+            InetAddress inetAddress = InetAddress.getLocalHost();
+            return inetAddress.getHostAddress();
+        } catch (UnknownHostException e) {
+            log.error("get ip failed");
+            return "";
+        }
+    }
+
+    /**
+     * 获取主机名称
+     */
+    private static String getHost() {
+        try {
+            InetAddress inetAddress = InetAddress.getLocalHost();
+            return inetAddress.getHostName();
+        } catch (UnknownHostException e) {
+            log.error("get host failed");
+            return "";
         }
     }
 }

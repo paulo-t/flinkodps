@@ -32,6 +32,7 @@ public class ProBufSchema implements KafkaDeserializationSchema<ConsumerRecord<S
     @Override
     public ConsumerRecord<String, Message> deserialize(ConsumerRecord<byte[], byte[]> consumerRecord) {
         try {
+            //第一次可能还没获取到配置流，没有配置信息，先等待一段时间
             if(isFirst){
                 Thread.sleep(30000);
                 isFirst = false;
