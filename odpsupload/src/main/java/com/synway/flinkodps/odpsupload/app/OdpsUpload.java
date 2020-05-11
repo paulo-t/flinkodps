@@ -66,14 +66,14 @@ public class OdpsUpload {
         Properties consumerConfig = new Properties();
         consumerConfig.setProperty("bootstrap.servers", ConfigUtils.get("bootstrap-servers", "1.1.1.5:9092,1.1.1.10:9092"));
         consumerConfig.setProperty("group.id", ConfigUtils.get("odps-group-id", "flink-odps"));
-        FlinkKafkaConsumer<ConsumerRecord<String, Message>> flinkKafkaConsumer = new FlinkKafkaConsumer<ConsumerRecord<String, Message>>(ConfigUtils.get("odps-topic", "HBASE"), new ProBufSchema(), consumerConfig);
+        FlinkKafkaConsumer<ConsumerRecord<String, Message>> flinkKafkaConsumer = new FlinkKafkaConsumer<ConsumerRecord<String, Message>>(ConfigUtils.get("odps-topic", "HBASE"), new ProBufSchema(ConfigUtils.get("stat-broker-list", "1.1.1.5:9092,1.1.1.10:9092"),ConfigUtils.get("stat-topic", "odpsStat")), consumerConfig);
         flinkKafkaConsumer.setStartFromEarliest();
 
         //1.数据源
         DataStream<ConsumerRecord<String, Message>> messageSource = env.addSource(flinkKafkaConsumer).uid("normal-data");
 
         //2.过滤空的消息
-        DataStream<ConsumerRecord<String, Message>> filteredMessage = messageSource.filter((FilterFunction<ConsumerRecord<String, Message>>) stringMessageConsumerRecord -> !Objects.isNull(stringMessageConsumerRecord)).uid("filter-operator");
+        DataStream<ConsumerRecord<String, Message>> filteredMessage = messageSource.filter((FilterFunction<ConsumerRecord<String, Message>>) stringMessageConsumerRecord -> !Objects.isNull(stringMessageConsumerRecord)).uid("not-null-normal-data");
 
         //3.每个协议的名字后面加一个随机标识
         DataStream<ConsumerRecord<String, Message>> dataWithFlag = filteredMessage.map(new RichMapFunction<ConsumerRecord<String, Message>, ConsumerRecord<String, Message>>() {
@@ -92,7 +92,7 @@ public class OdpsUpload {
                 int max = getRuntimeContext().getMaxNumberOfParallelSubtasks();
                 return str + "@" + ThreadLocalRandom.current().nextInt(max);
             }
-        });
+        }).uid("random-map");
 
         //4.按协议名划分数据
         KeyedStream<ConsumerRecord<String, Message>, String> messageKeyedStream = dataWithFlag.keyBy((KeySelector<ConsumerRecord<String, Message>, String>) record -> record.value().getDataType());
@@ -114,7 +114,7 @@ public class OdpsUpload {
         BroadcastStream<DBConfigInfo> broadcastConfig = env.addSource(new OraConfigSource(ConfigUtils.get("odps-table-project", "adpstabproject"), ConfigUtils.get("odps-ct-project", "adpsctproject"), ConfigUtils.get("data-type-list", "3"))).setParallelism(1).broadcast(configStateDescriptor, mappingStateDescriptor);
 
         //5.获取odps库中表的信息和数据
-        SingleOutputStreamOperator<OdpsInfo> dataWithDbInfoStream = messageKeyedStream.connect(broadcastConfig).process(new CreateOdpsInfo(configStateDescriptor, mappingStateDescriptor, noTableOutputTag));
+        SingleOutputStreamOperator<OdpsInfo> dataWithDbInfoStream = messageKeyedStream.connect(broadcastConfig).process(new CreateOdpsInfo(configStateDescriptor, mappingStateDescriptor, noTableOutputTag)).uid("odps-info");
 
         //没有查询到表信息的数据输出到文件
         DataStream<ConsumerRecord<String, Message>> noTableData = dataWithDbInfoStream.getSideOutput(noTableOutputTag);
@@ -143,7 +143,7 @@ public class OdpsUpload {
                     collector.collect(odpsInfo);
                 }
             }
-        });
+        }).uid("redo-max-filter");
 
         //达到最大次数输出到文件不在重试
         DataStream<OdpsInfo> maxRedoOutput = redoStream.getSideOutput(maxRedoTag);
@@ -152,7 +152,7 @@ public class OdpsUpload {
         //重试流和正常流合并
         DataStream<OdpsInfo> unionStream = dataWithDbInfoStream.union(dataWithDbInfoStream);
 
-        //6.union之后再做一次keyBy保证相同的表用同一个实例去处理
+        //6.union之后再做一次keyBy保证相同的表用同一个实例去处理同时状态保存为keyedState
         KeyedStream<OdpsInfo, String> odpsInfoStringKeyedStream = unionStream.keyBy((KeySelector<OdpsInfo, String>) odpsInfo -> odpsInfo.getTableId());
 
         //odpsSink属性
@@ -178,8 +178,12 @@ public class OdpsUpload {
         //重试的topic
         props.setProperty("redo.topic", ConfigUtils.get("redo-topic", "odpsRedo"));
         props.setProperty("program.tag", ConfigUtils.get("program-tag", "odpsUpload"));
+        //统计
+        props.setProperty("stat.broker.list", ConfigUtils.get("stat-broker-list", "1.1.1.5:9092,1.1.1.10:9092"));
+        props.setProperty("stat.topic", ConfigUtils.get("stat-topic", "odpsStat"));
+
         //7.数据写入odps
-        odpsInfoStringKeyedStream.addSink(new OdpsSink(props));
+        odpsInfoStringKeyedStream.addSink(new OdpsSink(props)).uid("odps-sink");
 
         env.execute(OdpsUpload.class.getSimpleName());
     }

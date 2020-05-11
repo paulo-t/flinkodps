@@ -10,6 +10,7 @@ import com.google.common.collect.Maps;
 import com.synway.flinkodps.common.utils.ParseUtil;
 import com.synway.flinkodps.odpsupload.app.model.OdpsInfo;
 import com.synway.flinkodps.odpsupload.app.model.SessionInfo;
+import com.synway.flinkodps.odpsupload.app.model.StdOdpsStatInfo;
 import com.synway.flinkodps.odpsupload.dal.DbBase;
 import com.synway.flinkodps.odpsupload.dal.jdbc.druid.impl.OraStatDal;
 import com.synway.flinkodps.odpsupload.dal.odps.OdpsDal;
@@ -86,7 +87,6 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
 
     @Override
     public void invoke(OdpsInfo odpsInfo, Context context) throws Exception {
-
         RecordAccumulator accumulator = getAccumulator(odpsInfo);
         appendData(accumulator, odpsInfo);
         if (accumulator.isFull()) {
@@ -110,7 +110,6 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
         }
 
         sessionState.clear();
-
 
         for (SessionInfo session : uploadSessions.values()) {
             sessionState.add(session);
@@ -192,36 +191,44 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
         //发送完成移除累加器数据
         recordAccumulators.remove(getSessionFlag(accumulator.getTableName(), accumulator.getProject()));
 
-        boolean commitRet = commit(session, accumulator,writeCount, 0L);
+        boolean commitRet = commit(session, accumulator, writeCount, 0L);
 
-        if(commitRet){
-            //统计成功数据
-        }else {
-            //统计失败数据
-
+        //统计信息
+        StdOdpsStatInfo stdOdpsStatInfo = new StdOdpsStatInfo();
+        stdOdpsStatInfo.setTableName(accumulator.getTableName());
+        stdOdpsStatInfo.setDataSource(accumulator.getSys());
+        String tableId = accumulator.getTableId();
+        String objEngName = "";
+        if (!StringUtils.isEmpty(tableId)) {
+            objEngName = tableId.split("@")[0];
         }
+        stdOdpsStatInfo.setObjEngName(objEngName);
+        stdOdpsStatInfo.setStateType(commitRet ? 1 : 0);
+        stdOdpsStatInfo.setRowCount(writeCount);
+
+        String statBrokerList = prop.getProperty("stat.broker.list");
+        String statRedoTopic = prop.getProperty("stat.topic");
+
+        KafkaUtils.sendData(statBrokerList,statRedoTopic,objEngName,stdOdpsStatInfo);
 
         return commitRet ? writeCount : 0;
     }
 
-    private boolean commit(SessionInfo session, RecordAccumulator accumulator,long writeCount, long time) {
+    private boolean commit(SessionInfo session, RecordAccumulator accumulator, long writeCount, long time) {
         try {
             session.getUploadSession().commit();
         } catch (TunnelException e) {
             //网络异常阻塞重试
             log.error("project:{}, table:{} session commit error, redo time {} :{}", accumulator.getProject(), accumulator.getTableName(), ++time, e.getMessage());
-            return commit(session, accumulator, writeCount,time);
+            return commit(session, accumulator, writeCount, time);
         } catch (IOException e) {
             //io异常直接重试
             redo(accumulator);
             return false;
         }
-        log.info("project:{}, table:{} commit success. count:{}",accumulator.getProject(),accumulator.getTableName(),writeCount);
+        log.info("project:{}, table:{} commit success. count:{}", accumulator.getProject(), accumulator.getTableName(), writeCount);
         return true;
     }
-
-    //统计方法
-
 
     /**
      * 重试
@@ -295,9 +302,9 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
 
 
         //机器信息初始化
-        if(StringUtils.isEmpty(machineTag)){
-            synchronized (MACHINE_TAG_LOCK){
-                if(StringUtils.isEmpty(machineTag)){
+        if (StringUtils.isEmpty(machineTag)) {
+            synchronized (MACHINE_TAG_LOCK) {
+                if (StringUtils.isEmpty(machineTag)) {
                     machineTag = getMachineTag();
                 }
             }
@@ -307,7 +314,7 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
 
     @Override
     public void close() throws Exception {
-        if(!executorService.isShutdown()){
+        if (!executorService.isShutdown()) {
             executorService.shutdown();
         }
     }
@@ -571,7 +578,7 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
     /**
      * 统计相关代码
      */
-    private String getMachineTag(){
+    private String getMachineTag() {
         String localIp = getIp();
         String programTag = prop.getProperty("program.tag");
 
@@ -588,17 +595,17 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
 
         List<Object[]> objects = oraStatDal.execBySql(sqlStr);
 
-        if(!CollectionUtils.isEmpty(objects)){
+        if (!CollectionUtils.isEmpty(objects)) {
             for (Object[] object : objects) {
-                if(!Objects.isNull(object) && object.length > 0)
-                return object[0].toString();
+                if (!Objects.isNull(object) && object.length > 0)
+                    return object[0].toString();
             }
         }
 
         return createNewMachineTag();
     }
 
-    private String createNewMachineTag(){
+    private String createNewMachineTag() {
         String newGuid = UUID.randomUUID().toString().replace("-", "");
         String programTag = prop.getProperty("progam.tag");
         String localIp = getIp();
@@ -618,10 +625,10 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
                 .append(")");
 
         if (oraStatDal.execSql(sql.toString())) {
-            log.info("machine tag create success.ip:{},host:{},program:{},guid:{}",localIp,hostName,programTag,newGuid);
+            log.info("machine tag create success.ip:{},host:{},program:{},guid:{}", localIp, hostName, programTag, newGuid);
             return newGuid;
-        }else {
-            log.info("machine tag create failed.ip:{},host:{},program:{},guid:{}",localIp,hostName,programTag,newGuid);
+        } else {
+            log.info("machine tag create failed.ip:{},host:{},program:{},guid:{}", localIp, hostName, programTag, newGuid);
             return "";
         }
     }

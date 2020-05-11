@@ -2,6 +2,8 @@ package com.synway.flinkodps.odpsupload.kafka;
 
 import com.google.common.collect.Lists;
 import com.google.protobuf.ByteString;
+import com.synway.flinkodps.odpsupload.app.model.StdOdpsStatInfo;
+import com.synway.flinkodps.odpsupload.utils.KafkaUtils;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.collections.CollectionUtils;
 import org.apache.flink.api.common.serialization.SimpleStringSchema;
@@ -22,6 +24,22 @@ import java.util.Objects;
 @Slf4j
 public class ProBufSchema implements KafkaDeserializationSchema<ConsumerRecord<String, Message>> {
     private static volatile boolean isFirst = true;
+
+    /**
+     * 统计服务器
+     */
+    private final String statBrokerList;
+
+    /**
+     * 统计主题
+     */
+    private final String statTopic;
+
+    public ProBufSchema(String statBrokerList,String statTopic){
+        this.statBrokerList = statBrokerList;
+        this.statTopic = statTopic;
+    }
+
     @Override
     public boolean isEndOfStream(ConsumerRecord<String, Message> stringMessageConsumerRecord) {
         return false;
@@ -29,11 +47,19 @@ public class ProBufSchema implements KafkaDeserializationSchema<ConsumerRecord<S
 
     private final SimpleStringSchema simpleStringSchema = new SimpleStringSchema();
 
+    //当前时间
+    private long startTime = System.currentTimeMillis();
+
+    //接收的数据量
+    private ThreadLocal<Long> receiveCount = ThreadLocal.withInitial(() -> 0L);
+
     @Override
     public ConsumerRecord<String, Message> deserialize(ConsumerRecord<byte[], byte[]> consumerRecord) {
+
+        System.out.println(Thread.currentThread().getId() + "deserialize: " + this.hashCode());
         try {
             //第一次可能还没获取到配置流，没有配置信息，先等待一段时间
-            if(isFirst){
+            if (isFirst) {
                 Thread.sleep(30000);
                 isFirst = false;
             }
@@ -64,6 +90,22 @@ public class ProBufSchema implements KafkaDeserializationSchema<ConsumerRecord<S
             message.setData(data);
 
             ConsumerRecord<String, Message> record = new ConsumerRecord(consumerRecord.topic(), consumerRecord.partition(), consumerRecord.offset(), key, message);
+            receiveCount.set(receiveCount.get() + 1);
+            long now = System.currentTimeMillis();
+
+            //5分钟统计一次这里先写死
+            if (now - startTime > 300000) {
+                StdOdpsStatInfo stdOdpsStatInfo = new StdOdpsStatInfo();
+                stdOdpsStatInfo.setRowCount(receiveCount.get());
+                stdOdpsStatInfo.setStateType(3);
+                stdOdpsStatInfo.setObjEngName("");
+                stdOdpsStatInfo.setDataSource(0);
+                stdOdpsStatInfo.setTableName("");
+                KafkaUtils.sendData(statBrokerList,statTopic,message.getDataType(),stdOdpsStatInfo);
+                receiveCount.set(0L);
+                startTime = now;
+            }
+            
             return record;
         } catch (Exception e) {
             log.info("data analysis failed, partition:{}, offset:{}", consumerRecord.partition(), consumerRecord.offset());
