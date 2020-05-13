@@ -7,15 +7,15 @@ import com.synway.flinkodps.odpsupload.app.model.OdpsInfo;
 import com.synway.flinkodps.odpsupload.app.model.OdpsTableConfig;
 import com.synway.flinkodps.odpsupload.app.sink.odps.OdpsSink;
 import com.synway.flinkodps.odpsupload.app.source.dbconfig.OraConfigSource;
+import com.synway.flinkodps.odpsupload.app.source.stat.StatSource;
 import com.synway.flinkodps.odpsupload.app.transformation.CreateOdpsInfo;
+import com.synway.flinkodps.odpsupload.app.transformation.SubDivide;
 import com.synway.flinkodps.odpsupload.constants.OdpsUploadConstant;
 import com.synway.flinkodps.odpsupload.kafka.Message;
 import com.synway.flinkodps.odpsupload.kafka.ProBufSchema;
 import com.synway.flinkodps.odpsupload.kafka.RedoSchema;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.lang3.StringUtils;
 import org.apache.flink.api.common.functions.FilterFunction;
-import org.apache.flink.api.common.functions.RichMapFunction;
 import org.apache.flink.api.common.state.MapStateDescriptor;
 import org.apache.flink.api.common.typeinfo.TypeHint;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
@@ -37,7 +37,6 @@ import org.apache.kafka.clients.consumer.ConsumerRecord;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Properties;
-import java.util.concurrent.ThreadLocalRandom;
 
 /**
  * @author: create by paulo
@@ -50,8 +49,8 @@ public class OdpsUpload {
     public static void main(String[] args) throws Exception {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         //checkpoint间隔15分钟
-        String checkPointIntervalStr = ConfigUtils.get("check-point-interval", "900000");
-        env.enableCheckpointing(ParseUtil.parseLong(checkPointIntervalStr, 900000));
+        String checkPointIntervalStr = ConfigUtils.get("check-point-interval", "60000");
+        env.enableCheckpointing(ParseUtil.parseLong(checkPointIntervalStr, 60000));
         //checkpoint模式
         env.getCheckpointConfig().setCheckpointingMode(CheckpointingMode.EXACTLY_ONCE);
         //两个checkpoint之间最小间隔500ms
@@ -75,24 +74,13 @@ public class OdpsUpload {
         //2.过滤空的消息
         DataStream<ConsumerRecord<String, Message>> filteredMessage = messageSource.filter((FilterFunction<ConsumerRecord<String, Message>>) stringMessageConsumerRecord -> !Objects.isNull(stringMessageConsumerRecord)).uid("not-null-normal-data");
 
-        //3.每个协议的名字后面加一个随机标识
-        DataStream<ConsumerRecord<String, Message>> dataWithFlag = filteredMessage.map(new RichMapFunction<ConsumerRecord<String, Message>, ConsumerRecord<String, Message>>() {
-            @Override
-            public ConsumerRecord<String, Message> map(ConsumerRecord<String, Message> record) throws Exception {
-                String tableId = record.value().getDataType();
-                record.value().setDataType(getRandomFlag(tableId));
-                return record;
-            }
+        MapStateDescriptor<String,Long> statStateDescriptor = new MapStateDescriptor("statState",Types.STRING,Types.LONG);
+        //统计数据源
+        DataStreamSource<Map<String, Long>> statSource = env.addSource(new StatSource()).setParallelism(1);
+        BroadcastStream<Map<String, Long>> broadcastStat = statSource.broadcast(statStateDescriptor);
 
-            private String getRandomFlag(String str) {
-                if(StringUtils.isEmpty(str)){
-                    return str;
-                }
-
-                int max = getRuntimeContext().getMaxNumberOfParallelSubtasks();
-                return str + "@" + ThreadLocalRandom.current().nextInt(max);
-            }
-        }).uid("random-map");
+        //3.细分每个协议的数据
+        DataStream<ConsumerRecord<String, Message>> dataWithFlag = filteredMessage.connect(broadcastStat).process(new SubDivide(statStateDescriptor)).uid("sub-divide");
 
         //4.按协议名划分数据
         KeyedStream<ConsumerRecord<String, Message>, String> messageKeyedStream = dataWithFlag.keyBy((KeySelector<ConsumerRecord<String, Message>, String>) record -> record.value().getDataType());
@@ -116,6 +104,7 @@ public class OdpsUpload {
         //5.获取odps库中表的信息和数据
         SingleOutputStreamOperator<OdpsInfo> dataWithDbInfoStream = messageKeyedStream.connect(broadcastConfig).process(new CreateOdpsInfo(configStateDescriptor, mappingStateDescriptor, noTableOutputTag)).uid("odps-info");
 
+        //dataWithDbInfoStream.print();
         //没有查询到表信息的数据输出到文件
         DataStream<ConsumerRecord<String, Message>> noTableData = dataWithDbInfoStream.getSideOutput(noTableOutputTag);
         noTableData.writeAsText("/data1/odpsupload/noTableData", FileSystem.WriteMode.NO_OVERWRITE);

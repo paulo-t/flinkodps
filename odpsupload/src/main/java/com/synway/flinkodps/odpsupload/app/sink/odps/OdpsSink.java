@@ -49,6 +49,8 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
     private static volatile ExecutorService executorService;
     //线程池锁
     private static final String threadPoolLock = "ODPS:THREAD:LOCK";
+    //累加器锁
+    private static final String accumulatorLock = "ODPS:ACCUMULATOR:LOCK:";
     //数据库操作
     private OdpsDal odpsDal;
     //统计数据
@@ -87,9 +89,21 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
 
     @Override
     public void invoke(OdpsInfo odpsInfo, Context context) throws Exception {
-        RecordAccumulator accumulator = getAccumulator(odpsInfo);
-        appendData(accumulator, odpsInfo);
+        String lock = accumulatorLock + getSessionFlag(odpsInfo.getTableName(), odpsInfo.getProject());
+
+        RecordAccumulator accumulator;
+        //防止多个subTask重复发送
+        synchronized (lock){
+            accumulator = getAccumulator(odpsInfo);
+            appendData(accumulator, odpsInfo);
+            if(accumulator.isFull()){
+                //满了移除累加器
+                recordAccumulators.remove(getSessionFlag(accumulator.getTableName(), accumulator.getProject()));
+            }
+        }
+
         if (accumulator.isFull()) {
+            log.info("{} is full:{}",accumulator.getTableName()+","+accumulator.getProject(),accumulator.getAppendCount().get());
             send(accumulator);
         }
     }
@@ -156,9 +170,9 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
             log.error("project:{},table:{} failed get upload session.", accumulator.getProject(), accumulator.getTableName());
             redo(accumulator);
         }
-
         //发送数据
         session.getNewBlockId();
+
         //将数据拆分成多份发送
         List<RecordAccumulator> recordAccumulators = splitAccumulator(accumulator);
 
@@ -188,9 +202,6 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
             i++;
         }
 
-        //发送完成移除累加器数据
-        recordAccumulators.remove(getSessionFlag(accumulator.getTableName(), accumulator.getProject()));
-
         boolean commitRet = commit(session, accumulator, writeCount, 0L);
 
         //统计信息
@@ -209,7 +220,7 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
         String statBrokerList = prop.getProperty("stat.broker.list");
         String statRedoTopic = prop.getProperty("stat.topic");
 
-        KafkaUtils.sendData(statBrokerList,statRedoTopic,objEngName,stdOdpsStatInfo);
+        KafkaUtils.sendData(statBrokerList, statRedoTopic, objEngName, stdOdpsStatInfo);
 
         return commitRet ? writeCount : 0;
     }
@@ -220,6 +231,12 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
         } catch (TunnelException e) {
             //网络异常阻塞重试
             log.error("project:{}, table:{} session commit error, redo time {} :{}", accumulator.getProject(), accumulator.getTableName(), ++time, e.getMessage());
+            try {
+                Thread.sleep(time * 5);
+            } catch (InterruptedException e1) {
+                redo(accumulator);
+                return false;
+            }
             return commit(session, accumulator, writeCount, time);
         } catch (IOException e) {
             //io异常直接重试
@@ -263,25 +280,41 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
     private List<RecordAccumulator> splitAccumulator(RecordAccumulator accumulator) {
         List<RecordAccumulator> ret = Lists.newArrayList();
 
-        for (AccumulatorData accumulatorData : accumulator.getData()) {
-            RecordAccumulator recordAccumulator = new RecordAccumulator();
-            recordAccumulator.setProject(accumulator.getProject());
-            recordAccumulator.setTableId(accumulator.getTableId());
-            recordAccumulator.setTableName(accumulator.getTableName());
-            recordAccumulator.setTableComment(accumulator.getTableComment());
-            recordAccumulator.setColCount(accumulator.getColCount());
-            recordAccumulator.setEtlRule(accumulator.getEtlRule());
-            recordAccumulator.setFields(accumulator.getFields());
-            recordAccumulator.setTransState(accumulator.getTransState());
-            recordAccumulator.setSys(accumulator.getSys());
-            recordAccumulator.setUpdateTime(System.currentTimeMillis());
-            recordAccumulator.setBatchSize(accumulator.getBatchSize());
-            recordAccumulator.append(accumulatorData);
+        int poolSize = ParseUtil.parseInt(prop.get("pool.size"), 5);
 
-            ret.add(recordAccumulator);
+        double batchNum = Math.ceil(accumulator.getData().size() * 1.0 / poolSize);
+
+        RecordAccumulator recordAccumulator = getNewRecordAccumulator(accumulator);
+
+        for (AccumulatorData accumulatorData : accumulator.getData()) {
+            if (recordAccumulator.getData().size() >= batchNum) {
+                ret.add(recordAccumulator);
+                recordAccumulator = getNewRecordAccumulator(accumulator);
+            } else {
+                recordAccumulator.append(accumulatorData);
+            }
         }
 
+        ret.add(recordAccumulator);
+
         return ret;
+    }
+
+    private RecordAccumulator getNewRecordAccumulator(RecordAccumulator accumulator) {
+        RecordAccumulator recordAccumulator = new RecordAccumulator();
+        recordAccumulator.setProject(accumulator.getProject());
+        recordAccumulator.setTableId(accumulator.getTableId());
+        recordAccumulator.setTableName(accumulator.getTableName());
+        recordAccumulator.setTableComment(accumulator.getTableComment());
+        recordAccumulator.setColCount(accumulator.getColCount());
+        recordAccumulator.setEtlRule(accumulator.getEtlRule());
+        recordAccumulator.setFields(accumulator.getFields());
+        recordAccumulator.setTransState(accumulator.getTransState());
+        recordAccumulator.setSys(accumulator.getSys());
+        recordAccumulator.setUpdateTime(System.currentTimeMillis());
+        recordAccumulator.setBatchSize(accumulator.getBatchSize());
+
+        return recordAccumulator;
     }
 
     @Override
@@ -291,7 +324,7 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
         if (Objects.isNull(executorService)) {
             synchronized (threadPoolLock) {
                 if (Objects.isNull(executorService)) {
-                    executorService = new ThreadPoolExecutor(2, poolSize, 60L, TimeUnit.SECONDS, new ArrayBlockingQueue<>(100));
+                    executorService = new ThreadPoolExecutor(2, poolSize, 60L, TimeUnit.SECONDS, new ArrayBlockingQueue<>(1000));
                 }
             }
         }
@@ -302,14 +335,13 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
 
 
         //机器信息初始化
-        if (StringUtils.isEmpty(machineTag)) {
+  /*      if (StringUtils.isEmpty(machineTag)) {
             synchronized (MACHINE_TAG_LOCK) {
                 if (StringUtils.isEmpty(machineTag)) {
                     machineTag = getMachineTag();
                 }
             }
-        }
-
+        }*/
     }
 
     @Override
@@ -398,6 +430,12 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
         } catch (TunnelException e) {
             //Tunnel异常递归重新获取
             log.error("创建uploadSession失败，开始第{}次重试", ++retryTime);
+            try {
+                Thread.sleep(retryTime * 5);
+            } catch (InterruptedException e1) {
+                log.error("create session error:" + e1.getMessage());
+                return null;
+            }
             return createUploadSession(tunnel, project, tableName, partition, retryTime);
         }
     }
@@ -416,7 +454,9 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
         tunnel.setEndpoint(prop.getProperty("tunnel.url"));
 
         TableTunnel.UploadSession uploadSession = createUploadSession(tunnel, project, tableName, partition, 0L);
-
+        if (Objects.isNull(uploadSession)) {
+            return null;
+        }
         sessionInfo.setUploadSession(uploadSession);
         sessionInfo.setCreateTime(System.currentTimeMillis());
         sessionInfo.setProject(project);

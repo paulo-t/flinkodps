@@ -52,8 +52,12 @@ public class OraConfigSource extends RichSourceFunction<DBConfigInfo> {
 
     @Override
     public void run(SourceContext<DBConfigInfo> context) throws Exception {
+        //第一次获取配置
+        context.collect(getDbConfigInfo());
+
         while (isRunning) {
-            ScheduledFuture<DBConfigInfo> schedule = scheduledExecutorService.schedule(new ConfigThread(), 5, TimeUnit.SECONDS);
+            //12小时更细一次配置
+            ScheduledFuture<DBConfigInfo> schedule = scheduledExecutorService.schedule(new ConfigThread(), 12, TimeUnit.HOURS);
             DBConfigInfo dbConfigInfo = schedule.get();
             context.collect(dbConfigInfo);
         }
@@ -61,7 +65,9 @@ public class OraConfigSource extends RichSourceFunction<DBConfigInfo> {
 
     @Override
     public void cancel() {
-        scheduledExecutorService.shutdown();
+        if(!scheduledExecutorService.isShutdown()){
+            scheduledExecutorService.shutdown();
+        }
         isRunning = false;
     }
 
@@ -75,17 +81,21 @@ public class OraConfigSource extends RichSourceFunction<DBConfigInfo> {
     private static class ConfigThread implements Callable<DBConfigInfo> {
         @Override
         public DBConfigInfo call() throws Exception {
-            DBConfigInfo dbConfigInfo = new DBConfigInfo();
-            dbConfigInfo.setTableData(tableConfig.getData());
-            log.info("资源库数据获取成功,数量:{},数据:{}", dbConfigInfo.getTableData().size(), dbConfigInfo.getTableData());
-
-            dbConfigInfo.setCtData(ctConfig.getData());
-            log.info("粗提库数据获取成功,数量:{},数据:{}", dbConfigInfo.getCtData().size(), dbConfigInfo.getCtData());
-
-            dbConfigInfo.setMappingData(tableConfig.getRelationData());
-            log.info("表映射数据获取成功,数量:{}，数据:{}", dbConfigInfo.getMappingData().size(), dbConfigInfo.getMappingData());
-
-            return dbConfigInfo;
+            return getDbConfigInfo();
         }
+    }
+
+    private static DBConfigInfo getDbConfigInfo(){
+        DBConfigInfo dbConfigInfo = new DBConfigInfo();
+        dbConfigInfo.setTableData(tableConfig.getData());
+        log.info("资源库数据获取成功,数量:{},数据:{}", dbConfigInfo.getTableData().size(), dbConfigInfo.getTableData());
+
+        dbConfigInfo.setCtData(ctConfig.getData());
+        log.info("粗提库数据获取成功,数量:{},数据:{}", dbConfigInfo.getCtData().size(), dbConfigInfo.getCtData());
+
+        dbConfigInfo.setMappingData(tableConfig.getRelationData());
+        log.info("表映射数据获取成功,数量:{}，数据:{}", dbConfigInfo.getMappingData().size(), dbConfigInfo.getMappingData());
+
+        return dbConfigInfo;
     }
 }

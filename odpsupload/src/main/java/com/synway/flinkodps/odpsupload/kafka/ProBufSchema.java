@@ -35,7 +35,7 @@ public class ProBufSchema implements KafkaDeserializationSchema<ConsumerRecord<S
      */
     private final String statTopic;
 
-    public ProBufSchema(String statBrokerList,String statTopic){
+    public  ProBufSchema(String statBrokerList,String statTopic){
         this.statBrokerList = statBrokerList;
         this.statTopic = statTopic;
     }
@@ -51,12 +51,10 @@ public class ProBufSchema implements KafkaDeserializationSchema<ConsumerRecord<S
     private long startTime = System.currentTimeMillis();
 
     //接收的数据量
-    private ThreadLocal<Long> receiveCount = ThreadLocal.withInitial(() -> 0L);
+    private long receiveCount = 0L;
 
     @Override
     public ConsumerRecord<String, Message> deserialize(ConsumerRecord<byte[], byte[]> consumerRecord) {
-
-        System.out.println(Thread.currentThread().getId() + "deserialize: " + this.hashCode());
         try {
             //第一次可能还没获取到配置流，没有配置信息，先等待一段时间
             if (isFirst) {
@@ -90,22 +88,22 @@ public class ProBufSchema implements KafkaDeserializationSchema<ConsumerRecord<S
             message.setData(data);
 
             ConsumerRecord<String, Message> record = new ConsumerRecord(consumerRecord.topic(), consumerRecord.partition(), consumerRecord.offset(), key, message);
-            receiveCount.set(receiveCount.get() + 1);
+            receiveCount += data.size();
             long now = System.currentTimeMillis();
 
             //5分钟统计一次这里先写死
             if (now - startTime > 300000) {
                 StdOdpsStatInfo stdOdpsStatInfo = new StdOdpsStatInfo();
-                stdOdpsStatInfo.setRowCount(receiveCount.get());
+                stdOdpsStatInfo.setRowCount(receiveCount);
                 stdOdpsStatInfo.setStateType(3);
                 stdOdpsStatInfo.setObjEngName("");
                 stdOdpsStatInfo.setDataSource(0);
                 stdOdpsStatInfo.setTableName("");
                 KafkaUtils.sendData(statBrokerList,statTopic,message.getDataType(),stdOdpsStatInfo);
-                receiveCount.set(0L);
+                receiveCount = 0L;
                 startTime = now;
             }
-            
+
             return record;
         } catch (Exception e) {
             log.info("data analysis failed, partition:{}, offset:{}", consumerRecord.partition(), consumerRecord.offset());

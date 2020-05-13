@@ -56,7 +56,7 @@ public class CreateOdpsInfo extends KeyedBroadcastProcessFunction<String, Consum
 
         if(!StringUtils.isEmpty(record.value().getDataType())){
             String[] splits = record.value().getDataType().split("@");
-            judgeStr = splits[0];
+            judgeStr = splits[0].toLowerCase();
         }
 
         //表名为空
