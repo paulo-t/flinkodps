@@ -30,6 +30,7 @@ import org.apache.flink.streaming.api.datastream.*;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.ProcessFunction;
 import org.apache.flink.streaming.connectors.kafka.FlinkKafkaConsumer;
+import org.apache.flink.streaming.connectors.kafka.FlinkKafkaConsumer09;
 import org.apache.flink.util.Collector;
 import org.apache.flink.util.OutputTag;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -48,7 +49,7 @@ import java.util.Properties;
 public class OdpsUpload {
     public static void main(String[] args) throws Exception {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-        //checkpoint间隔15分钟
+        //checkpoint间隔1分钟
         String checkPointIntervalStr = ConfigUtils.get("check-point-interval", "60000");
         env.enableCheckpointing(ParseUtil.parseLong(checkPointIntervalStr, 60000));
         //checkpoint模式
@@ -63,9 +64,13 @@ public class OdpsUpload {
 
         //kafka消费者配置
         Properties consumerConfig = new Properties();
-        consumerConfig.setProperty("bootstrap.servers", ConfigUtils.get("bootstrap-servers", "1.1.1.5:9092,1.1.1.10:9092"));
+        consumerConfig.setProperty("bootstrap.servers", ConfigUtils.get("bootstrap-servers", "10.1.13.75:9092,10.1.13.76:9092"));
         consumerConfig.setProperty("group.id", ConfigUtils.get("odps-group-id", "flink-odps"));
-        FlinkKafkaConsumer<ConsumerRecord<String, Message>> flinkKafkaConsumer = new FlinkKafkaConsumer<ConsumerRecord<String, Message>>(ConfigUtils.get("odps-topic", "HBASE"), new ProBufSchema(ConfigUtils.get("stat-broker-list", "1.1.1.5:9092,1.1.1.10:9092"),ConfigUtils.get("stat-topic", "odpsStat")), consumerConfig);
+        /*consumerConfig.setProperty("flink.poll-timeout",)*/
+
+        //FlinkKafkaConsumer09<ConsumerRecord<String, Message>> flinkKafkaConsumer = new FlinkKafkaConsumer09(ConfigUtils.get("odps-topic", "HBASE"), new ProBufSchema(ConfigUtils.get("stat-broker-list", "10.1.13.75:9092,10.1.13.76:9092"),ConfigUtils.get("stat-topic", "odpsStat")), consumerConfig);
+
+        FlinkKafkaConsumer<ConsumerRecord<String, Message>> flinkKafkaConsumer = new FlinkKafkaConsumer<ConsumerRecord<String, Message>>(ConfigUtils.get("odps-topic", "HBASE"), new ProBufSchema(ConfigUtils.get("stat-broker-list", "10.1.13.75:9092,10.1.13.76:9092"),ConfigUtils.get("stat-topic", "odpsStat")), consumerConfig);
         flinkKafkaConsumer.setStartFromEarliest();
 
         //1.数据源
@@ -76,11 +81,11 @@ public class OdpsUpload {
 
         MapStateDescriptor<String,Long> statStateDescriptor = new MapStateDescriptor("statState",Types.STRING,Types.LONG);
         //统计数据源
-        DataStreamSource<Map<String, Long>> statSource = env.addSource(new StatSource()).setParallelism(1);
+        DataStreamSource<Map<String, Long>> statSource = env.addSource(new StatSource(ParseUtil.parseInt(ConfigUtils.get("stat-success-id","196"),196),ParseUtil.parseInt(ConfigUtils.get("stat-fail-id","197"),197))).setParallelism(1);
         BroadcastStream<Map<String, Long>> broadcastStat = statSource.broadcast(statStateDescriptor);
 
         //3.细分每个协议的数据
-        DataStream<ConsumerRecord<String, Message>> dataWithFlag = filteredMessage.connect(broadcastStat).process(new SubDivide(statStateDescriptor)).uid("sub-divide");
+        DataStream<ConsumerRecord<String, Message>> dataWithFlag = filteredMessage.connect(broadcastStat).process(new SubDivide(statStateDescriptor,ParseUtil.parseInt(ConfigUtils.get("devide-count","100000"),100000))).uid("sub-divide");
 
         //4.按协议名划分数据
         KeyedStream<ConsumerRecord<String, Message>, String> messageKeyedStream = dataWithFlag.keyBy((KeySelector<ConsumerRecord<String, Message>, String>) record -> record.value().getDataType());
@@ -102,12 +107,12 @@ public class OdpsUpload {
         BroadcastStream<DBConfigInfo> broadcastConfig = env.addSource(new OraConfigSource(ConfigUtils.get("odps-table-project", "adpstabproject"), ConfigUtils.get("odps-ct-project", "adpsctproject"), ConfigUtils.get("data-type-list", "3"))).setParallelism(1).broadcast(configStateDescriptor, mappingStateDescriptor);
 
         //5.获取odps库中表的信息和数据
-        SingleOutputStreamOperator<OdpsInfo> dataWithDbInfoStream = messageKeyedStream.connect(broadcastConfig).process(new CreateOdpsInfo(configStateDescriptor, mappingStateDescriptor, noTableOutputTag)).uid("odps-info");
+        SingleOutputStreamOperator<OdpsInfo> dataWithDbInfoStream = messageKeyedStream.connect(broadcastConfig).process(new CreateOdpsInfo(configStateDescriptor, mappingStateDescriptor, noTableOutputTag,ParseUtil.parseInt(ConfigUtils.get("test-mode","0"),0))).uid("odps-info");
 
         //dataWithDbInfoStream.print();
         //没有查询到表信息的数据输出到文件
         DataStream<ConsumerRecord<String, Message>> noTableData = dataWithDbInfoStream.getSideOutput(noTableOutputTag);
-        noTableData.writeAsText("/data1/odpsupload/noTableData", FileSystem.WriteMode.NO_OVERWRITE);
+        //noTableData.writeAsText("/data1/odpsupload/noTableData", FileSystem.WriteMode.NO_OVERWRITE);
 
         //重试kafka消费者配置
         Properties redoConfig = new Properties();
@@ -136,7 +141,7 @@ public class OdpsUpload {
 
         //达到最大次数输出到文件不在重试
         DataStream<OdpsInfo> maxRedoOutput = redoStream.getSideOutput(maxRedoTag);
-        maxRedoOutput.writeAsText("/data1/odpsupload/redoMax");
+        //maxRedoOutput.writeAsText("/data1/odpsupload/redoMax");
 
         //重试流和正常流合并
         DataStream<OdpsInfo> unionStream = dataWithDbInfoStream.union(dataWithDbInfoStream);
@@ -170,6 +175,7 @@ public class OdpsUpload {
         //统计
         props.setProperty("stat.broker.list", ConfigUtils.get("stat-broker-list", "1.1.1.5:9092,1.1.1.10:9092"));
         props.setProperty("stat.topic", ConfigUtils.get("stat-topic", "odpsStat"));
+        props.setProperty("redo.time",ConfigUtils.get("odps-redo-time","1000"));
 
         //7.数据写入odps
         odpsInfoStringKeyedStream.addSink(new OdpsSink(props)).uid("odps-sink");

@@ -15,11 +15,11 @@ import java.util.List;
 @ToString
 public class Message {
     /**
-     * 表名
+     * 协议名
      */
     private String dataType;
     /**
-     * 扩展信息
+     * 表名
      */
     private String dataTypeEx;
     /**

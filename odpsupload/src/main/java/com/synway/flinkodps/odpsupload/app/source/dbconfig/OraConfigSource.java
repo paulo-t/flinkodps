@@ -5,6 +5,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.functions.source.RichSourceFunction;
 
+import java.util.Objects;
 import java.util.concurrent.*;
 
 /**
@@ -22,7 +23,9 @@ public class OraConfigSource extends RichSourceFunction<DBConfigInfo> {
     /**
      * 定时线程池
      */
-    private ScheduledExecutorService scheduledExecutorService;
+    private static volatile ScheduledExecutorService scheduledExecutorService;
+
+    private static String CONFIG_SOURCE_LOCK = "configSourceLock";
     /**
      * 表类型
      */
@@ -73,7 +76,14 @@ public class OraConfigSource extends RichSourceFunction<DBConfigInfo> {
 
     @Override
     public void open(Configuration parameters) throws Exception {
-        scheduledExecutorService = Executors.newSingleThreadScheduledExecutor();
+        if(Objects.isNull(scheduledExecutorService)){
+            synchronized (CONFIG_SOURCE_LOCK){
+                if(Objects.isNull(scheduledExecutorService)){
+                    scheduledExecutorService = Executors.newSingleThreadScheduledExecutor();
+                }
+            }
+        }
+
         tableConfig = new TableConfig(odpsTableProject, odpsCtProject, dataTypeList);
         ctConfig = new CtConfig(odpsTableProject, odpsCtProject, dataTypeList);
     }

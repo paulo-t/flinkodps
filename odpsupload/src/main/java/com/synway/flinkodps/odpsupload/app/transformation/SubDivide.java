@@ -26,8 +26,11 @@ import java.util.concurrent.ThreadLocalRandom;
 public class SubDivide extends BroadcastProcessFunction<ConsumerRecord<String, Message>, Map<String, Long>, ConsumerRecord<String, Message>> {
     private final MapStateDescriptor<String, Long> statStateDescriptor;
 
-    public SubDivide(MapStateDescriptor<String, Long> statStateDescriptor) {
+    private int devideCount;
+
+    public SubDivide(MapStateDescriptor<String, Long> statStateDescriptor,int devideCount) {
         this.statStateDescriptor = statStateDescriptor;
+        this.devideCount = devideCount;
     }
 
     @Override
@@ -63,7 +66,7 @@ public class SubDivide extends BroadcastProcessFunction<ConsumerRecord<String, M
         if (Objects.isNull(count) || count == 0) {
             randomNum = max;
         } else {
-            long var1 = count / 1000000 + 1;
+            long var1 = count / devideCount + 1;
             randomNum = var1 > max ? max : (int) var1;
         }
 

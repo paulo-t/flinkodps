@@ -48,9 +48,7 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
     //线程池
     private static volatile ExecutorService executorService;
     //线程池锁
-    private static final String threadPoolLock = "ODPS:THREAD:LOCK";
-    //累加器锁
-    private static final String accumulatorLock = "ODPS:ACCUMULATOR:LOCK:";
+    private static final String threadPoolLock = "ODPS:SINK:THREAD:LOCK";
     //数据库操作
     private OdpsDal odpsDal;
     //统计数据
@@ -61,13 +59,12 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
     private transient ListState<RecordAccumulator> recordAccumulatorState;
     private ListStateDescriptor<RecordAccumulator> recordAccumulatorListStateDescriptor;
     //保存所有的数据累加器
-    private static Map<String, RecordAccumulator> recordAccumulators = Maps.newConcurrentMap();
+    private Map<String, RecordAccumulator> recordAccumulators = Maps.newConcurrentMap();
     //session状态
     private transient ListState<SessionInfo> sessionState;
     private ListStateDescriptor<SessionInfo> infoListStateDescriptor;
     //保存所有的uploadSession
-    private static Map<String, SessionInfo> uploadSessions = Maps.newConcurrentMap();
-
+    private Map<String, SessionInfo> uploadSessions = Maps.newConcurrentMap();
     /**
      * 统计时使用的机器标识
      */
@@ -89,21 +86,14 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
 
     @Override
     public void invoke(OdpsInfo odpsInfo, Context context) throws Exception {
-        String lock = accumulatorLock + getSessionFlag(odpsInfo.getTableName(), odpsInfo.getProject());
-
         RecordAccumulator accumulator;
-        //防止多个subTask重复发送
-        synchronized (lock){
-            accumulator = getAccumulator(odpsInfo);
-            appendData(accumulator, odpsInfo);
-            if(accumulator.isFull()){
-                //满了移除累加器
-                recordAccumulators.remove(getSessionFlag(accumulator.getTableName(), accumulator.getProject()));
-            }
-        }
 
+        accumulator = getAccumulator(odpsInfo);
+        appendData(accumulator, odpsInfo);
         if (accumulator.isFull()) {
-            log.info("{} is full:{}",accumulator.getTableName()+","+accumulator.getProject(),accumulator.getAppendCount().get());
+            log.info("{} is full:{}", accumulator.getTableName() + "," + accumulator.getProject(), accumulator.getAppendCount().get());
+            //满了移除累加器
+            recordAccumulators.remove(getSessionFlag(accumulator.getTableName(), accumulator.getProject()));
             send(accumulator);
         }
     }
@@ -172,7 +162,6 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
         }
         //发送数据
         session.getNewBlockId();
-
         //将数据拆分成多份发送
         List<RecordAccumulator> recordAccumulators = splitAccumulator(accumulator);
 
@@ -195,7 +184,7 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
             try {
                 writeCount += result.get();
             } catch (InterruptedException | ExecutionException e) {
-                //每一部分出错值单独重试
+                //每一部分出错单独重试
                 log.error("single data send error add to redo:{}", e.getMessage());
                 redo(uploadThread.getRecordAccumulator());
             }
@@ -226,6 +215,13 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
     }
 
     private boolean commit(SessionInfo session, RecordAccumulator accumulator, long writeCount, long time) {
+        //重试次数达到最大不在重试
+        if (time >= 1000) {
+            log.error("commit max time error");
+            redo(accumulator);
+            return false;
+        }
+
         try {
             session.getUploadSession().commit();
         } catch (TunnelException e) {
@@ -420,6 +416,12 @@ public class OdpsSink extends RichSinkFunction<OdpsInfo> implements Checkpointed
      * 创建上传的session
      */
     private TableTunnel.UploadSession createUploadSession(TableTunnel tunnel, String project, String tableName, String partition, long retryTime) {
+        int redoTime = ParseUtil.parseInt(prop.getProperty("redo.time"), 1000);
+        if (retryTime > redoTime) {
+            log.error("create session max retry time");
+            return null;
+        }
+
         try {
             if (partition.length() == 0) {
                 return tunnel.createUploadSession(project, tableName);

@@ -34,14 +34,17 @@ public class CreateOdpsInfo extends KeyedBroadcastProcessFunction<String, Consum
     //表信息状态
     private MapStateDescriptor<String, Map<String, OdpsTableConfig>> configStateDescriptor;
     //映射关系状态
-    private MapStateDescriptor<String, Map<String,String>> mappingStateDescriptor;
+    private MapStateDescriptor<String, Map<String, String>> mappingStateDescriptor;
     //找不到数据库表配置信息的数据输出流tag
     private OutputTag<ConsumerRecord<String, Message>> noTableOutputTag;
+    //测试标志
+    private int testFlag = 0;
 
-    public CreateOdpsInfo(MapStateDescriptor<String, Map<String, OdpsTableConfig>> configStateDescriptor,MapStateDescriptor<String, Map<String,String>> mappingStateDescriptor,OutputTag<ConsumerRecord<String, Message>> noTableOutputTag){
+    public CreateOdpsInfo(MapStateDescriptor<String, Map<String, OdpsTableConfig>> configStateDescriptor, MapStateDescriptor<String, Map<String, String>> mappingStateDescriptor, OutputTag<ConsumerRecord<String, Message>> noTableOutputTag, int testFlag) {
         this.configStateDescriptor = configStateDescriptor;
         this.mappingStateDescriptor = mappingStateDescriptor;
         this.noTableOutputTag = noTableOutputTag;
+        this.testFlag = testFlag;
     }
 
     @Override
@@ -54,27 +57,28 @@ public class CreateOdpsInfo extends KeyedBroadcastProcessFunction<String, Consum
         Map<String, String> mappingDbConfig = mappingConfigState.get(MAPPING_DATA_KEY);
         String judgeStr = "";
 
-        if(!StringUtils.isEmpty(record.value().getDataType())){
+        if (!StringUtils.isEmpty(record.value().getDataType())) {
             String[] splits = record.value().getDataType().split("@");
             judgeStr = splits[0].toLowerCase();
         }
 
         //表名为空
-        if(StringUtils.isEmpty(judgeStr)){
-            log.error("data table name is null.partition:{},offset:{}",record.partition(),record.offset());
-            readOnlyContext.output(noTableOutputTag,record);
+        if (StringUtils.isEmpty(judgeStr)) {
+            log.error("data table name is null.partition:{},offset:{}", record.partition(), record.offset());
+            readOnlyContext.output(noTableOutputTag, record);
         }
 
         OdpsTableConfig dbConfig = getJudgeMap(judgeStr, tableDbConfig, ctDbConfig, mappingDbConfig);
-        if(Objects.isNull(dbConfig)){
-            log.error("table {} get judge failed.",judgeStr);
-            readOnlyContext.output(noTableOutputTag,record);
+        if (Objects.isNull(dbConfig)) {
+            log.error("table {} get judge failed.", judgeStr);
+            readOnlyContext.output(noTableOutputTag, record);
             return;
         }
 
         //表信息和数据的组合
         OdpsInfo odpsInfo = new OdpsInfo();
-        odpsInfo.setProject(dbConfig.getProject());
+
+        odpsInfo.setProject(testFlag == 1 ? dbConfig.getProject() + "_tfy" : dbConfig.getProject());
         odpsInfo.setTableId(readOnlyContext.getCurrentKey());
         odpsInfo.setTableName(dbConfig.getTableName());
         odpsInfo.setTableComment(dbConfig.getTableComment());
@@ -101,35 +105,35 @@ public class CreateOdpsInfo extends KeyedBroadcastProcessFunction<String, Consum
         BroadcastState<String, Map<String, String>> mappingConfig = context.getBroadcastState(mappingStateDescriptor);
 
         //资源库数据
-        if(Objects.isNull(dbConfigInfo)){
+        if (Objects.isNull(dbConfigInfo)) {
             log.info("query db config error!");
-            return ;
+            return;
         }
 
         //替换资源库数据
         Map<String, OdpsTableConfig> tableData = dbConfigInfo.getTableData();
-        if(MapUtils.isNotEmpty(tableData)){
-            tableConfig.put(TABLE_DATA_KEY,tableData);
-            log.info("update table data success.count:{}",tableData.size());
-        }else {
+        if (MapUtils.isNotEmpty(tableData)) {
+            tableConfig.put(TABLE_DATA_KEY, tableData);
+            log.info("update table data success.count:{}", tableData.size());
+        } else {
             log.info("table data is empty!");
         }
 
         //替换粗提库数据
         Map<String, OdpsTableConfig> ctData = dbConfigInfo.getCtData();
-        if(MapUtils.isNotEmpty(ctData)){
-            tableConfig.put(CT_DATA_KEY,ctData);
-            log.info("update ct data success.count:{}",ctData.size());
-        }else {
+        if (MapUtils.isNotEmpty(ctData)) {
+            tableConfig.put(CT_DATA_KEY, ctData);
+            log.info("update ct data success.count:{}", ctData.size());
+        } else {
             log.info("ct data is empty!");
         }
 
         //替换映射数据
         Map<String, String> mappingData = dbConfigInfo.getMappingData();
-        if(MapUtils.isNotEmpty(mappingData)){
-            mappingConfig.put(MAPPING_DATA_KEY,mappingData);
-            log.info("update mapping data success.count:{}",mappingData.size());
-        }else {
+        if (MapUtils.isNotEmpty(mappingData)) {
+            mappingConfig.put(MAPPING_DATA_KEY, mappingData);
+            log.info("update mapping data success.count:{}", mappingData.size());
+        } else {
             log.info("mapping data is empty!");
         }
     }
@@ -137,18 +141,18 @@ public class CreateOdpsInfo extends KeyedBroadcastProcessFunction<String, Consum
     /**
      * 获取表信息
      */
-    public OdpsTableConfig getJudgeMap(String strDataType, Map<String, OdpsTableConfig>tableData, Map<String, OdpsTableConfig> ctData, Map<String, String> mappingData) {
+    public OdpsTableConfig getJudgeMap(String strDataType, Map<String, OdpsTableConfig> tableData, Map<String, OdpsTableConfig> ctData, Map<String, String> mappingData) {
         if (Objects.isNull(strDataType)) {
             return null;
         }
 
         String parentTable = getParentTable(strDataType, mappingData);
 
-        if(MapUtils.isNotEmpty(tableData) && tableData.containsKey(parentTable)){
+        if (MapUtils.isNotEmpty(tableData) && tableData.containsKey(parentTable)) {
             return tableData.get(parentTable);
         }
 
-        if(MapUtils.isNotEmpty(ctData) && ctData.containsKey(parentTable)){
+        if (MapUtils.isNotEmpty(ctData) && ctData.containsKey(parentTable)) {
             return ctData.get(parentTable);
         }
 

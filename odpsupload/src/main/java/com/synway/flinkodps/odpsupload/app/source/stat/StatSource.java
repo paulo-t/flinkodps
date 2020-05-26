@@ -4,6 +4,7 @@ import com.google.common.collect.Maps;
 import com.synway.flinkodps.odpsupload.app.model.ExceptionInfo;
 import com.synway.flinkodps.odpsupload.dal.DbBase;
 import com.synway.flinkodps.odpsupload.dal.jdbc.druid.impl.OraStatDal;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.collections.CollectionUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.time.DateUtils;
@@ -14,6 +15,7 @@ import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.*;
 import java.util.stream.Collectors;
 
@@ -23,6 +25,7 @@ import java.util.stream.Collectors;
  * @description: com.synway.flinkodps.odpsupload.app.source.stat
  * @date:2020/5/11
  */
+@Slf4j
 public class StatSource extends RichSourceFunction<Map<String, Long>> {
     private static SimpleDateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd");
     /**
@@ -33,13 +36,30 @@ public class StatSource extends RichSourceFunction<Map<String, Long>> {
     /**
      * 定时线程池
      */
-    private ScheduledExecutorService scheduledExecutorService;
+    private static volatile ScheduledExecutorService scheduledExecutorService;
+    /**
+     * 统计线程池锁
+     */
+    private static String STAT_POOL_LOCK = "StatPoolLock";
 
     /**
      * 统计层数据访问
      */
     private static DbBase statDal;
 
+    /**
+     * 成功统计id
+     */
+    private int statSuccessId;
+    /**
+     * 失败统计id
+     */
+    private int statFailId;
+
+    public StatSource(int statSuccessId,int statFailId){
+        this.statSuccessId = statSuccessId;
+        this.statFailId = statFailId;
+    }
 
     @Override
     public void run(SourceContext<Map<String, Long>> sourceContext) throws Exception {
@@ -49,6 +69,7 @@ public class StatSource extends RichSourceFunction<Map<String, Long>> {
         while (isRunning){
             ScheduledFuture<Map<String, Long>> schedule = scheduledExecutorService.schedule(new StatThread(), 1, TimeUnit.MINUTES);
             Map<String, Long> statInfo = schedule.get();
+            log.info("statInfo:{}",statInfo);
             sourceContext.collect(statInfo);
         }
     }
@@ -63,19 +84,25 @@ public class StatSource extends RichSourceFunction<Map<String, Long>> {
 
     @Override
     public void open(Configuration parameters) throws Exception {
-        scheduledExecutorService = Executors.newSingleThreadScheduledExecutor();
+        if(Objects.isNull(scheduledExecutorService)){
+            synchronized (STAT_POOL_LOCK){
+                if(Objects.isNull(scheduledExecutorService)){
+                    scheduledExecutorService = Executors.newSingleThreadScheduledExecutor();
+                }
+            }
+        }
 
         statDal = OraStatDal.build();
     }
 
-    private static class StatThread implements Callable<Map<String, Long>> {
+    private class StatThread implements Callable<Map<String, Long>> {
         @Override
         public Map<String, Long> call() throws Exception {
             return getStatData();
         }
     }
 
-    private static Map<String, Long> getStatData() {
+    private Map<String, Long> getStatData() {
         Map<String, Long> statMap = Maps.newHashMap();
 
         StringBuilder sb = new StringBuilder();
@@ -85,7 +112,12 @@ public class StatSource extends RichSourceFunction<Map<String, Long>> {
                 .append("from EXCEPTIONINFO ")
                 .append("where TO_CHAR(EI_UPDATETIME,'yyyy-mm-dd') = '")
                 .append(todayStr)
-                .append("'");
+                .append("'")
+                .append(" and ED_ID IN(")
+                .append(statSuccessId)
+                .append(",")
+                .append(statFailId)
+                .append(")");
 
         String strSql = sb.toString();
 
@@ -106,5 +138,4 @@ public class StatSource extends RichSourceFunction<Map<String, Long>> {
 
         return statMap;
     }
-
 }

@@ -1,6 +1,7 @@
 package com.synway.flinkodps.odpsupload.kafka;
 
 import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
 import com.google.protobuf.ByteString;
 import com.synway.flinkodps.odpsupload.app.model.StdOdpsStatInfo;
 import com.synway.flinkodps.odpsupload.utils.KafkaUtils;
@@ -13,6 +14,7 @@ import org.apache.flink.streaming.connectors.kafka.KafkaDeserializationSchema;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -26,6 +28,11 @@ public class ProBufSchema implements KafkaDeserializationSchema<ConsumerRecord<S
     private static volatile boolean isFirst = true;
 
     /**
+     * 每个协议的数据量
+     */
+    private Map<String, Long> dataCount = Maps.newHashMap();
+
+    /**
      * 统计服务器
      */
     private final String statBrokerList;
@@ -35,7 +42,7 @@ public class ProBufSchema implements KafkaDeserializationSchema<ConsumerRecord<S
      */
     private final String statTopic;
 
-    public  ProBufSchema(String statBrokerList,String statTopic){
+    public ProBufSchema(String statBrokerList, String statTopic) {
         this.statBrokerList = statBrokerList;
         this.statTopic = statTopic;
     }
@@ -49,9 +56,6 @@ public class ProBufSchema implements KafkaDeserializationSchema<ConsumerRecord<S
 
     //当前时间
     private long startTime = System.currentTimeMillis();
-
-    //接收的数据量
-    private long receiveCount = 0L;
 
     @Override
     public ConsumerRecord<String, Message> deserialize(ConsumerRecord<byte[], byte[]> consumerRecord) {
@@ -88,19 +92,30 @@ public class ProBufSchema implements KafkaDeserializationSchema<ConsumerRecord<S
             message.setData(data);
 
             ConsumerRecord<String, Message> record = new ConsumerRecord(consumerRecord.topic(), consumerRecord.partition(), consumerRecord.offset(), key, message);
-            receiveCount += data.size();
+
+            if (dataCount.containsKey(record.value().getDataType())) {
+                dataCount.put(record.value().getDataType(), dataCount.get(record.value().getDataType()) + 1);
+            } else {
+                dataCount.put(record.value().getDataType(), 1L);
+            }
+
+            log.info("kafka count stat:count:{}, value:{}", dataCount.size(), dataCount);
+
             long now = System.currentTimeMillis();
 
             //5分钟统计一次这里先写死
             if (now - startTime > 300000) {
-                StdOdpsStatInfo stdOdpsStatInfo = new StdOdpsStatInfo();
-                stdOdpsStatInfo.setRowCount(receiveCount);
-                stdOdpsStatInfo.setStateType(3);
-                stdOdpsStatInfo.setObjEngName("");
-                stdOdpsStatInfo.setDataSource(0);
-                stdOdpsStatInfo.setTableName("");
-                KafkaUtils.sendData(statBrokerList,statTopic,message.getDataType(),stdOdpsStatInfo);
-                receiveCount = 0L;
+                for (String tableId : dataCount.keySet()) {
+                    Long count = dataCount.get(tableId);
+                    StdOdpsStatInfo stdOdpsStatInfo = new StdOdpsStatInfo();
+                    stdOdpsStatInfo.setRowCount(count);
+                    stdOdpsStatInfo.setStateType(3);
+                    stdOdpsStatInfo.setObjEngName(tableId);
+                    stdOdpsStatInfo.setDataSource(0);
+                    stdOdpsStatInfo.setTableName("");
+                    KafkaUtils.sendData(statBrokerList, statTopic, message.getDataType(), stdOdpsStatInfo);
+                }
+                dataCount.clear();
                 startTime = now;
             }
 
